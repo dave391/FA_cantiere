@@ -1,0 +1,98 @@
+Voglio trasformare la  trasformare la mia app da manuale ad automatica.
+Di seguito le istruzioni corrette del bot: 
+
+Logiche Corrette del Bot
+🎯 FASE 1: Condizioni di Entrata (SOLO quando utente clicca START)
+Trigger: Utente clicca START
+Controlli:
+❓ C'è già un bot attivo per questo utente? NO
+❓ L'utente ha abbastanza capitale sugli exchange selezionati? SÌ
+✅ Se tutto OK → Apre posizioni LONG + SHORT IMMEDIATAMENTE
+
+✅ NESSUN controllo di funding rate o condizioni di mercato
+✅ NESSUN monitoraggio continuo per entrata
+✅ SOLO: bot non attivo + capitale sufficiente = APRI SUBITO
+🎯 FASE 2: Monitoraggio Continuo (ogni 10 secondi)
+SOLO DOPO che le posizioni sono aperte, ogni 10 secondi:
+👁️ Controlla livelli di rischio (prezzo vs liquidation price)
+❌ NON controlla P&L
+❌ NON controlla funding rates  
+❌ NON controlla altri parametri
+
+Focus: SOLO sicurezza posizioni (distanza da liquidazione)
+🎯 FASE 3: Decisioni Automatiche
+Il bot decide automaticamente di:
+🚪 CHIUDERE TUTTE le posizioni quando:
+   - Livello di rischio > soglia predeterminata
+   - (Prezzo troppo vicino a liquidation price)
+   
+❌ NO take profit automatici
+❌ NO stop loss in USDT
+✅ SOLO stop di emergenza per evitare liquidazione
+🎯 FASE 4: Riapertura Automatica
+Dopo chiusura posizioni:
+🔄 Ricontrolla condizioni FASE 1:
+   - Bot attivo? (rimane SÌ)
+   - Capitale sufficiente? 
+🔄 Se OK → Riapre nuove posizioni IMMEDIATAMENTE
+🔄 Ripete il ciclo infinitamente fino a STOP utente
+🎯 FASE 5: Bilanciamento Margine (2 volte al giorno)
+Controllo automatico indipendente (CronJob 12:00 e 00:00):
+
+Condizione: Bot attivo per l'utente
+Controllo:
+👁️ Margine posizione Exchange A vs Exchange B
+👁️ Se margine sproporzionato (es. differenza >20%):
+   - Rimuovi margine da posizione con più margine
+   - Trasferisci fondi all'altro exchange  
+   - Aggiungi margine alla posizione con meno margine
+
+✅ Questo controllo è SEPARATO dalle altre fasi
+✅ Non influenza il monitoraggio ogni 10 secondi
+✅ Solo se bot attivo
+🏗️ Architettura Corretta
+Moduli Necessari:
+core/
+├── bot_engine.py          # Orchestrazione generale
+├── entry_manager.py       # FASE 1: Solo controlli entrata
+├── risk_monitor.py        # FASE 2: Solo controllo rischio liquidazione  
+├── emergency_closer.py    # FASE 3: Solo chiusura emergenza
+├── cycle_manager.py       # FASE 4: Gestione riapertura
+└── margin_balancer.py     # FASE 5: Bilanciamento margine (cronjob)
+Timers Separati:
+1. Loop principale ogni 10 secondi (FASE 2 + 3 + 4)
+2. CronJob 2 volte al giorno (FASE 5)
+
+
+📋 Riassunto Architettura Finale
+🎯 Moduli Core (5 file principali)
+core/bot_engine.py      # Orchestratore (150 righe)
+core/entry_manager.py   # FASE 1: Entrata (100 righe)  
+core/risk_monitor.py    # FASE 2: Monitoraggio rischio (80 righe)
+core/emergency_closer.py # FASE 3: Chiusura emergenza (60 righe)
+core/cycle_manager.py   # FASE 4: Riapertura (40 righe)
+🕒 Servizi Background (2 file)
+core/margin_balancer.py    # FASE 5: Bilanciamento margine (100 righe)
+services/scheduler.py      # CronJob manager (50 righe)
+💾 Database e Utility (3 file)
+database/mongo_manager.py # Operazioni MongoDB (200 righe)
+api/exchange_manager.py   # Wrapper exchange esistenti (150 righe)
+main.py                   # Entry point + BotManager (80 righe)
+🗄️ Database MongoDB (7 collections)
+users              # Configurazioni utenti e credenziali
+bot_configs        # Configurazioni strategia per utente
+bot_status         # Stato corrente bot (running/stopped)
+active_positions   # Posizioni attive con risk monitoring
+trade_history      # Storico operazioni
+risk_events        # Log eventi di rischio
+margin_balance_logs # Log bilanciamenti margine
+⚡ Flusso Operativo
+
+Utente clicca START → bot_status.status = "running"
+BotManager rileva nuovo bot attivo → Crea TradingBot(user_id)
+TradingBot.start() → Controlli + apertura immediata posizioni
+Loop ogni 10 secondi → Solo controllo rischio liquidazione
+Se rischio alto → Chiusura + tentativo riapertura
+CronJob 2x/giorno → Bilanciamento margine se necessario
+
+Ho già inizializzato il DB e creato le collections. 
