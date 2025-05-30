@@ -195,6 +195,116 @@ def _bybit_internal_transfer(amount, from_wallet='funding', to_wallet='unified')
             "error": f"Errore durante il trasferimento interno ByBit: {str(e)}"
         }
 
+def _bitfinex_internal_transfer(amount, from_wallet='exchange', to_wallet='margin'):
+    """
+    Esegue un trasferimento interno su Bitfinex tra wallet
+    
+    Args:
+        amount (float): Quantità di USDT da trasferire
+        from_wallet (str): Wallet di origine (default: exchange)
+        to_wallet (str): Wallet di destinazione (default: margin)
+        
+    Returns:
+        dict: Risultato dell'operazione
+    """
+    try:
+        logger.info(f"Trasferimento interno Bitfinex: {amount} USDT da {from_wallet} a {to_wallet}")
+        
+        # Determina la valuta corretta in base al wallet di origine
+        actual_currency = "USTF0" if from_wallet == "margin" else "UST"
+        
+        # Determina la valuta di destinazione in base al wallet di destinazione
+        actual_currency_to = "USTF0" if to_wallet == "margin" else "UST"
+        
+        api = CCXTAPI('bitfinex')
+        
+        # Prepara i parametri per la richiesta API
+        params = {
+            "from": from_wallet,
+            "to": to_wallet,
+            "currency": actual_currency,
+            "amount": str(amount)
+        }
+        
+        # Se la valuta di origine e destinazione sono diverse, aggiungila ai parametri
+        if actual_currency != actual_currency_to:
+            params["currency_to"] = actual_currency_to
+            logger.info(f"Conversione da {actual_currency} a {actual_currency_to}")
+        
+        # Tentativo con metodo CCXT
+        try:
+            if hasattr(api.exchange, 'privatePostAuthWTransfer'):
+                result = api.exchange.privatePostAuthWTransfer(params)
+                
+                # Verifica la risposta
+                if result and isinstance(result, list) and len(result) > 0:
+                    status = result[6] if len(result) > 6 else "UNKNOWN"
+                    
+                    if status == "SUCCESS":
+                        return {
+                            "success": True,
+                            "message": f"Trasferimento interno Bitfinex di {amount} USDT da {from_wallet} a {to_wallet} completato con successo",
+                            "transaction_id": result[2] if len(result) > 2 else None,
+                            "info": result
+                        }
+                    else:
+                        error_msg = result[7] if len(result) > 7 else "Errore sconosciuto"
+                        return {
+                            "success": False,
+                            "error": f"Trasferimento interno Bitfinex fallito: {status} - {error_msg}",
+                            "info": result
+                        }
+            else:
+                raise Exception("Metodo privatePostAuthWTransfer non disponibile")
+                
+        except Exception as ccxt_error:
+            logger.warning(f"Metodo CCXT fallito: {str(ccxt_error)}")
+            
+            # Fallback alla API nativa Bitfinex
+            try:
+                from bitfinex_api import BitfinexAPI
+                bitfinex_api = BitfinexAPI()
+                
+                # Ripeti il trasferimento usando la classe nativa
+                result = bitfinex_api._make_request('POST', 'auth/w/transfer', True, None, params)
+                
+                # Verifica la risposta
+                if result and isinstance(result, list) and len(result) > 0:
+                    status = result[6] if len(result) > 6 else "UNKNOWN"
+                    
+                    if status == "SUCCESS":
+                        return {
+                            "success": True,
+                            "message": f"Trasferimento interno Bitfinex di {amount} USDT da {from_wallet} a {to_wallet} completato con successo (API nativa)",
+                            "transaction_id": result[2] if len(result) > 2 else None,
+                            "info": result
+                        }
+                    else:
+                        error_msg = result[7] if len(result) > 7 else "Errore sconosciuto"
+                        return {
+                            "success": False,
+                            "error": f"Trasferimento interno Bitfinex fallito (API nativa): {status} - {error_msg}",
+                            "info": result
+                        }
+                else:
+                    return {
+                        "success": False,
+                        "error": "Risposta API non valida (API nativa)",
+                        "info": result
+                    }
+            except Exception as api_error:
+                return {
+                    "success": False,
+                    "error": f"Tutti i metodi di trasferimento falliti. CCXT: {str(ccxt_error)}, API Nativa: {str(api_error)}"
+                }
+                
+    except Exception as e:
+        logger.error(f"Errore durante il trasferimento interno Bitfinex: {str(e)}")
+        return {
+            "success": False,
+            "error": f"Errore durante il trasferimento interno Bitfinex: {str(e)}"
+        }
+
 def check_bitmex_balance(required_usdt):
     """
     Controlla il saldo disponibile su BitMEX
@@ -372,7 +482,16 @@ def check_bybit_balance(required_usdt):
         
         # Controllo 2: Totale è sufficiente ma serve trasferimento
         elif total_balance >= required_usdt:
-            transfer_amount = required_usdt - unified_balance
+            # Calcola l'importo da trasferire con arrotondamento
+            raw_transfer_amount = required_usdt - unified_balance
+            
+            # Se il saldo unified è molto basso (< 0.01), trasferisci l'intero importo richiesto
+            if unified_balance < 0.01:
+                transfer_amount = required_usdt
+            else:
+                # Altrimenti arrotonda l'importo della differenza a 2 decimali
+                transfer_amount = round(raw_transfer_amount, 2)
+            
             st.warning(f"⚠️ ByBit: Serve trasferimento da funding a unified ({transfer_amount} USDT)")
             
             # Prima verifica che ci sia abbastanza nel funding wallet
@@ -403,6 +522,10 @@ def check_bybit_balance(required_usdt):
                 new_unified = new_balance.get('USDT', {}).get('free', 0)
                 if 'unified' in new_balance:
                     new_unified = new_balance['unified'].get('USDT', {}).get('free', 0)
+                
+                # Se non riusciamo a rilevare il nuovo saldo, stimiamolo
+                if new_unified == 0:
+                    new_unified = unified_balance + transfer_amount
                 
                 return {
                     "success": True,
@@ -448,6 +571,277 @@ def check_bybit_balance(required_usdt):
             "error": f"Errore nel controllo saldo ByBit: {str(e)}"
         }
 
+def check_bitfinex_balance(required_usdt):
+    """
+    Controlla il saldo disponibile su Bitfinex e gestisce i trasferimenti tra wallet
+    
+    Args:
+        required_usdt: USDT richiesti per la posizione
+        
+    Returns:
+        dict: Risultato del controllo e eventuale trasferimento
+    """
+    try:
+        st.write(f"🔍 **Controllo saldo Bitfinex** (richiesto: {required_usdt} USDT)")
+        
+        api = CCXTAPI('bitfinex')
+        
+        # Recupera il saldo
+        balance = api.exchange.fetch_balance()
+        
+        # Inizializza i saldi
+        margin_balance = 0
+        exchange_balance = 0
+        funding_balance = 0
+        
+        # Bitfinex usa diversi codici valuta in base al wallet
+        # In wallet margin: USTF0
+        # In wallet exchange: UST
+        
+        # Controlla saldo nel wallet margin (dove serve per trading con leva)
+        if 'margin' in balance:
+            margin_balance = balance['margin'].get('USTF0', {}).get('free', 0)
+            if margin_balance == 0:
+                margin_balance = balance['margin'].get('USDT', {}).get('free', 0)
+        
+        # Controlla saldo nel wallet exchange
+        if 'exchange' in balance:
+            exchange_balance = balance['exchange'].get('UST', {}).get('free', 0)
+            if exchange_balance == 0:
+                exchange_balance = balance['exchange'].get('USDT', {}).get('free', 0)
+        
+        # Controlla saldo nel wallet funding
+        if 'funding' in balance:
+            funding_balance = balance['funding'].get('UST', {}).get('free', 0)
+            if funding_balance == 0:
+                funding_balance = balance['funding'].get('USDT', {}).get('free', 0)
+        
+        # Alternativa: cerca nel formato info
+        if 'info' in balance:
+            for wallet_info in balance['info']:
+                if len(wallet_info) >= 3:
+                    wallet_type = wallet_info[0]
+                    currency = wallet_info[1]
+                    balance_amount = float(wallet_info[2])
+                    
+                    # Wallet margin
+                    if wallet_type == 'margin' and (currency == 'USTF0' or currency == 'USDT') and balance_amount > 0:
+                        margin_balance = balance_amount
+                    
+                    # Wallet exchange
+                    if wallet_type == 'exchange' and (currency == 'UST' or currency == 'USDT') and balance_amount > 0:
+                        exchange_balance = balance_amount
+                        
+                    # Wallet funding
+                    if wallet_type == 'funding' and (currency == 'UST' or currency == 'USDT') and balance_amount > 0:
+                        funding_balance = balance_amount
+        
+        total_balance = margin_balance + exchange_balance + funding_balance
+        
+        st.write(f"💰 **Saldo Bitfinex finale:**")
+        st.write(f"  - Margin: {margin_balance} USDT")
+        st.write(f"  - Exchange: {exchange_balance} USDT")
+        st.write(f"  - Funding: {funding_balance} USDT")
+        st.write(f"  - Totale: {total_balance} USDT")
+        
+        # Controllo 1: Margin è già sufficiente
+        if margin_balance >= required_usdt:
+            st.success(f"✅ Bitfinex: Saldo margin sufficiente ({margin_balance} >= {required_usdt})")
+            return {
+                "success": True,
+                "margin_balance": margin_balance,
+                "exchange_balance": exchange_balance,
+                "funding_balance": funding_balance,
+                "total_balance": total_balance,
+                "required": required_usdt,
+                "transfer_needed": False,
+                "sufficient": True
+            }
+        
+        # Controllo 2: Exchange ha fondi, serve trasferimento a margin
+        elif exchange_balance >= (required_usdt - margin_balance):
+            # Calcola l'importo da trasferire (solo quello che manca per raggiungere il required)
+            # Arrotonda a 2 decimali per evitare problemi con numeri molto piccoli
+            raw_transfer_amount = required_usdt - margin_balance
+            
+            # Se la differenza è quasi uguale al required (differenza < 0.01), trasferisci l'intero required
+            if margin_balance < 0.01:
+                transfer_amount = required_usdt
+            else:
+                # Altrimenti arrotonda l'importo della differenza a 2 decimali
+                transfer_amount = round(raw_transfer_amount, 2)
+            
+            st.warning(f"⚠️ Bitfinex: Serve trasferimento da exchange a margin ({transfer_amount} USDT)")
+            
+            # Esegui il trasferimento usando la funzione dedicata
+            st.write(f"🔄 **Esecuzione trasferimento Bitfinex:**")
+            st.write(f"  - Da: Exchange wallet ({exchange_balance} USDT)")
+            st.write(f"  - A: Margin wallet ({margin_balance} USDT)")
+            st.write(f"  - Importo: {transfer_amount} USDT")
+            
+            # Usa la funzione di trasferimento interno
+            transfer_result = _bitfinex_internal_transfer(transfer_amount, 'exchange', 'margin')
+            
+            if transfer_result['success']:
+                st.success(f"✅ {transfer_result['message']}")
+                
+                # Verifica il nuovo saldo dopo breve attesa
+                time.sleep(3)
+                new_balance = api.exchange.fetch_balance()
+                
+                # Aggiorna il saldo del wallet margin
+                new_margin = 0
+                if 'margin' in new_balance:
+                    new_margin = new_balance['margin'].get('USTF0', {}).get('free', 0)
+                    if new_margin == 0:
+                        new_margin = new_balance['margin'].get('USDT', {}).get('free', 0)
+                
+                # Se non riusciamo a rilevare il nuovo saldo, stimiamolo
+                if new_margin == 0:
+                    new_margin = margin_balance + transfer_amount
+                
+                return {
+                    "success": True,
+                    "margin_balance": new_margin,
+                    "exchange_balance": exchange_balance - transfer_amount,
+                    "funding_balance": funding_balance,
+                    "total_balance": total_balance,
+                    "required": required_usdt,
+                    "transfer_needed": True,
+                    "transfer_amount": transfer_amount,
+                    "transfer_completed": True,
+                    "sufficient": True
+                }
+            else:
+                st.error(f"❌ {transfer_result['error']}")
+                return {
+                    "success": False,
+                    "error": transfer_result['error'],
+                    "transfer_needed": True,
+                    "transfer_completed": False,
+                    "manual_action_required": True
+                }
+        
+        # Controllo 3: Funding ha fondi, serve trasferimento funding -> exchange -> margin
+        elif funding_balance >= (required_usdt - margin_balance) and exchange_balance + funding_balance >= (required_usdt - margin_balance):
+            # Calcola l'importo da trasferire (solo quello che manca per raggiungere il required)
+            raw_transfer_amount = required_usdt - margin_balance
+            
+            # Se la differenza è quasi uguale al required (differenza < 0.01), trasferisci l'intero required
+            if margin_balance < 0.01:
+                transfer_amount = required_usdt
+            else:
+                # Altrimenti arrotonda l'importo della differenza a 2 decimali
+                transfer_amount = round(raw_transfer_amount, 2)
+                
+            st.warning(f"⚠️ Bitfinex: Servono due trasferimenti: funding -> exchange -> margin ({transfer_amount} USDT)")
+            
+            # Calcola quanto prelevare da funding
+            funding_transfer = min(transfer_amount, funding_balance)
+            # Arrotonda anche questo importo
+            funding_transfer = round(funding_transfer, 2)
+            
+            # Passo 1: Trasferimento da funding a exchange
+            st.write(f"🔄 **Esecuzione trasferimento Bitfinex (Passo 1/2):**")
+            st.write(f"  - Da: Funding wallet ({funding_balance} USDT)")
+            st.write(f"  - A: Exchange wallet ({exchange_balance} USDT)")
+            st.write(f"  - Importo: {funding_transfer} USDT")
+            
+            transfer_result1 = _bitfinex_internal_transfer(funding_transfer, 'funding', 'exchange')
+            
+            if not transfer_result1['success']:
+                st.error(f"❌ {transfer_result1['error']}")
+                return {
+                    "success": False,
+                    "error": transfer_result1['error'],
+                    "step": "funding_to_exchange",
+                    "transfer_needed": True,
+                    "transfer_completed": False,
+                    "manual_action_required": True
+                }
+            
+            st.success(f"✅ {transfer_result1['message']}")
+            
+            # Attendi il settlement dopo il primo trasferimento
+            st.info("⏱️ Attendo il completamento del settlement (10 secondi)...")
+            time.sleep(10)
+            
+            # Aggiorna i saldi dopo il primo trasferimento
+            exchange_balance += funding_transfer
+            funding_balance -= funding_transfer
+            
+            # Passo 2: Trasferimento da exchange a margin
+            st.write(f"🔄 **Esecuzione trasferimento Bitfinex (Passo 2/2):**")
+            st.write(f"  - Da: Exchange wallet ({exchange_balance} USDT)")
+            st.write(f"  - A: Margin wallet ({margin_balance} USDT)")
+            st.write(f"  - Importo: {transfer_amount} USDT")
+            
+            transfer_result2 = _bitfinex_internal_transfer(transfer_amount, 'exchange', 'margin')
+            
+            if transfer_result2['success']:
+                st.success(f"✅ {transfer_result2['message']}")
+                
+                # Verifica il nuovo saldo dopo breve attesa
+                time.sleep(3)
+                new_balance = api.exchange.fetch_balance()
+                
+                # Aggiorna il saldo del wallet margin
+                new_margin = 0
+                if 'margin' in new_balance:
+                    new_margin = new_balance['margin'].get('USTF0', {}).get('free', 0)
+                    if new_margin == 0:
+                        new_margin = new_balance['margin'].get('USDT', {}).get('free', 0)
+                
+                # Se non riusciamo a rilevare il nuovo saldo, stimiamolo
+                if new_margin == 0:
+                    new_margin = margin_balance + transfer_amount
+                
+                return {
+                    "success": True,
+                    "margin_balance": new_margin,
+                    "exchange_balance": exchange_balance - transfer_amount,
+                    "funding_balance": funding_balance,
+                    "total_balance": total_balance,
+                    "required": required_usdt,
+                    "transfer_needed": True,
+                    "transfer_amount": transfer_amount,
+                    "transfer_completed": True,
+                    "sufficient": True
+                }
+            else:
+                st.error(f"❌ {transfer_result2['error']}")
+                return {
+                    "success": False,
+                    "error": transfer_result2['error'],
+                    "step": "exchange_to_margin",
+                    "transfer_needed": True,
+                    "transfer_completed": False,
+                    "manual_action_required": True
+                }
+        
+        # Controllo 4: Totale insufficiente
+        else:
+            shortage = required_usdt - total_balance
+            st.error(f"❌ Bitfinex: Saldo totale insufficiente (mancano {shortage} USDT)")
+            return {
+                "success": False,
+                "margin_balance": margin_balance,
+                "exchange_balance": exchange_balance,
+                "funding_balance": funding_balance,
+                "total_balance": total_balance,
+                "required": required_usdt,
+                "sufficient": False,
+                "shortage": shortage,
+                "error": f"Saldo insufficiente: {total_balance} USDT totali, {required_usdt} USDT richiesti"
+            }
+            
+    except Exception as e:
+        st.error(f"❌ Errore nel controllo saldo Bitfinex: {str(e)}")
+        return {
+            "success": False,
+            "error": f"Errore nel controllo saldo Bitfinex: {str(e)}"
+        }
+
 def check_capital_requirements(exchange_long, exchange_short, required_usdt_per_position):
     """
     Controlla i requisiti di capitale per entrambi gli exchange
@@ -473,6 +867,8 @@ def check_capital_requirements(exchange_long, exchange_short, required_usdt_per_
         results["long_exchange"]["check"] = check_bitmex_balance(required_usdt_per_position)
     elif exchange_long == "ByBit":
         results["long_exchange"]["check"] = check_bybit_balance(required_usdt_per_position)
+    elif exchange_long == "Bitfinex":
+        results["long_exchange"]["check"] = check_bitfinex_balance(required_usdt_per_position)
     else:
         st.warning(f"⚠️ Controllo capitale per {exchange_long} non ancora implementato")
         results["long_exchange"]["check"] = {"success": False, "error": "Exchange non supportato"}
@@ -482,6 +878,8 @@ def check_capital_requirements(exchange_long, exchange_short, required_usdt_per_
         results["short_exchange"]["check"] = check_bitmex_balance(required_usdt_per_position)
     elif exchange_short == "ByBit":
         results["short_exchange"]["check"] = check_bybit_balance(required_usdt_per_position)
+    elif exchange_short == "Bitfinex":
+        results["short_exchange"]["check"] = check_bitfinex_balance(required_usdt_per_position)
     else:
         st.warning(f"⚠️ Controllo capitale per {exchange_short} non ancora implementato")
         results["short_exchange"]["check"] = {"success": False, "error": "Exchange non supportato"}
@@ -908,6 +1306,7 @@ def funding_arbitrage_app():
             else:
                 st.error("❌ **Impossibile procedere: capitale insufficiente**")
     
+    # Pulsante per gestire le posizioni (se esistono)
     # Pulsante per gestire le posizioni (se esistono)
     if 'has_open_positions' in st.session_state and st.session_state['has_open_positions']:
         if st.button("Gestisci Posizioni", type="secondary", use_container_width=True):
