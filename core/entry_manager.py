@@ -6,9 +6,13 @@ Gestisce i controlli di entrata e l'apertura delle posizioni iniziali.
 import logging
 import time
 import uuid
+import math
+import os
 from datetime import datetime, timezone
 import sys
-import os
+import streamlit as st
+from dotenv import load_dotenv
+from ccxt_api import CCXTAPI
 
 # Configurazione logging
 logging.basicConfig(level=logging.INFO)
@@ -30,12 +34,825 @@ class EntryManager:
         self.db = db
         self.exchange = exchange
         
+        # Carica le variabili d'ambiente
+        load_dotenv()
+        
         logger.info(f"EntryManager inizializzato per l'utente {user_id}")
+    
+    def get_sol_price(self):
+        """Ottiene il prezzo corrente di SOL da uno degli exchange"""
+        try:
+            api = CCXTAPI('bybit')
+            ticker = api.exchange.fetch_ticker('SOL/USDT')
+            price = ticker['last']
+            logger.info(f"Prezzo SOL ottenuto da ByBit: {price} USDT")
+            return float(price)
+        except Exception as e:
+            logger.warning(f"Errore nel recupero prezzo da ByBit: {str(e)}")
+            
+            try:
+                api = CCXTAPI('bitmex')
+                ticker = api.exchange.fetch_ticker('SOLUSDT')
+                price = ticker['last']
+                logger.info(f"Prezzo SOL ottenuto da BitMEX: {price} USDT")
+                return float(price)
+            except Exception as e:
+                logger.warning(f"Errore nel recupero prezzo da BitMEX: {str(e)}")
+                
+                estimated_price = 100.0
+                logger.warning(f"Uso prezzo stimato: {estimated_price} USDT")
+                return estimated_price
+    
+    def calculate_sol_size(self, usdt_amount):
+        """
+        Calcola la quantità di SOL da acquistare dato un importo in USDT
+        
+        Args:
+            usdt_amount: Importo in USDT da investire
+            
+        Returns:
+            dict: Risultato con il valore calcolato
+        """
+        half_usdt = usdt_amount / 2
+        leveraged_usdt = half_usdt * 5
+        sol_price = self.get_sol_price()
+        
+        if sol_price <= 0:
+            return {
+                "success": False,
+                "error": "Impossibile ottenere il prezzo di SOLANA"
+            }
+        
+        sol_quantity = leveraged_usdt / sol_price
+        sol_size = math.floor(sol_quantity * 10) / 10
+        
+        return {
+            "success": True,
+            "sol_size": sol_size,
+            "details": {
+                "usdt_total": usdt_amount,
+                "usdt_per_position": half_usdt,
+                "usdt_leveraged": leveraged_usdt,
+                "sol_price": sol_price,
+                "sol_quantity_raw": sol_quantity,
+                "sol_size_final": sol_size
+            }
+        }
+    
+    def _bybit_internal_transfer(self, amount, from_wallet='funding', to_wallet='unified'):
+        """Esegue un trasferimento interno su ByBit tra i wallet"""
+        try:
+            logger.info(f"Trasferimento interno ByBit: {amount} USDT da {from_wallet} a {to_wallet}")
+            
+            api = CCXTAPI('bybit')
+            
+            try:
+                result = api.exchange.transfer(
+                    code='USDT',
+                    amount=amount,
+                    fromAccount=from_wallet,
+                    toAccount=to_wallet
+                )
+                
+                if result:
+                    return {
+                        "success": True,
+                        "message": f"Trasferimento interno ByBit di {amount} USDT da {from_wallet} a {to_wallet} completato con successo",
+                        "transaction_id": result.get('id'),
+                        "method": "CCXT",
+                        "info": result
+                    }
+                else:
+                    return {
+                        "success": False,
+                        "error": "Trasferimento CCXT restituito None"
+                    }
+                    
+            except Exception as ccxt_error:
+                logger.warning(f"Metodo CCXT fallito: {str(ccxt_error)}")
+                
+                try:
+                    transfer_id = f"bybit_transfer_{int(time.time() * 1000)}"
+                    
+                    wallet_mapping = {
+                        'funding': 'FUND',
+                        'unified': 'UNIFIED',
+                        'spot': 'SPOT',
+                        'derivative': 'CONTRACT'
+                    }
+                    
+                    from_account_type = wallet_mapping.get(from_wallet, from_wallet.upper())
+                    to_account_type = wallet_mapping.get(to_wallet, to_wallet.upper())
+                    
+                    params = {
+                        'transferId': transfer_id,
+                        'coin': 'USDT',
+                        'amount': str(amount),
+                        'fromAccountType': from_account_type,
+                        'toAccountType': to_account_type
+                    }
+                    
+                    logger.info(f"Tentativo API v5 con parametri: {params}")
+                    result = api.exchange.private_post_v5_asset_transfer_inter_transfer(params)
+                    
+                    if result and result.get('retCode') == 0:
+                        return {
+                            "success": True,
+                            "message": f"Trasferimento interno ByBit di {amount} USDT da {from_wallet} a {to_wallet} completato con successo",
+                            "transaction_id": result.get('result', {}).get('transferId', transfer_id),
+                            "method": "API_v5",
+                            "info": result
+                        }
+                    else:
+                        error_msg = result.get('retMsg', 'Errore sconosciuto') if result else 'Nessuna risposta'
+                        return {
+                            "success": False,
+                            "error": f"Trasferimento API v5 fallito: {error_msg}",
+                            "method": "API_v5",
+                            "info": result
+                        }
+                        
+                except Exception as api_error:
+                    logger.error(f"Anche il metodo API v5 è fallito: {str(api_error)}")
+                    return {
+                        "success": False,
+                        "error": f"Tutti i metodi di trasferimento falliti. CCXT: {str(ccxt_error)}, API v5: {str(api_error)}"
+                    }
+                    
+        except Exception as e:
+            logger.error(f"Errore durante il trasferimento interno ByBit: {str(e)}")
+            return {
+                "success": False,
+                "error": f"Errore durante il trasferimento interno ByBit: {str(e)}"
+            }
+    
+    def _bitfinex_internal_transfer(self, amount, from_wallet='exchange', to_wallet='margin'):
+        """Esegue un trasferimento interno su Bitfinex tra i wallet"""
+        try:
+            logger.info(f"Trasferimento interno Bitfinex: {amount} USDT da {from_wallet} a {to_wallet}")
+            
+            actual_currency = "USTF0" if from_wallet == "margin" else "UST"
+            actual_currency_to = "USTF0" if to_wallet == "margin" else "UST"
+            
+            api = CCXTAPI('bitfinex')
+            
+            params = {
+                "from": from_wallet,
+                "to": to_wallet,
+                "currency": actual_currency,
+                "amount": str(amount)
+            }
+            
+            if actual_currency != actual_currency_to:
+                params["currency_to"] = actual_currency_to
+                logger.info(f"Conversione da {actual_currency} a {actual_currency_to}")
+            
+            try:
+                if hasattr(api.exchange, 'privatePostAuthWTransfer'):
+                    result = api.exchange.privatePostAuthWTransfer(params)
+                    
+                    if result and isinstance(result, list) and len(result) > 0:
+                        status = result[6] if len(result) > 6 else "UNKNOWN"
+                        
+                        if status == "SUCCESS":
+                            return {
+                                "success": True,
+                                "message": f"Trasferimento interno Bitfinex di {amount} USDT da {from_wallet} a {to_wallet} completato con successo",
+                                "transaction_id": result[2] if len(result) > 2 else None,
+                                "info": result
+                            }
+                        else:
+                            error_msg = result[7] if len(result) > 7 else "Errore sconosciuto"
+                            return {
+                                "success": False,
+                                "error": f"Trasferimento interno Bitfinex fallito: {status} - {error_msg}",
+                                "info": result
+                            }
+                else:
+                    raise Exception("Metodo privatePostAuthWTransfer non disponibile")
+                    
+            except Exception as ccxt_error:
+                logger.warning(f"Metodo CCXT fallito: {str(ccxt_error)}")
+                
+                try:
+                    from bitfinex_api import BitfinexAPI
+                    bitfinex_api = BitfinexAPI()
+                    
+                    result = bitfinex_api._make_request('POST', 'auth/w/transfer', True, None, params)
+                    
+                    if result and isinstance(result, list) and len(result) > 0:
+                        status = result[6] if len(result) > 6 else "UNKNOWN"
+                        
+                        if status == "SUCCESS":
+                            return {
+                                "success": True,
+                                "message": f"Trasferimento interno Bitfinex di {amount} USDT da {from_wallet} a {to_wallet} completato con successo (API nativa)",
+                                "transaction_id": result[2] if len(result) > 2 else None,
+                                "info": result
+                            }
+                        else:
+                            error_msg = result[7] if len(result) > 7 else "Errore sconosciuto"
+                            return {
+                                "success": False,
+                                "error": f"Trasferimento interno Bitfinex fallito (API nativa): {status} - {error_msg}",
+                                "info": result
+                            }
+                    else:
+                        return {
+                            "success": False,
+                            "error": "Risposta API non valida (API nativa)",
+                            "info": result
+                        }
+                except Exception as api_error:
+                    return {
+                        "success": False,
+                        "error": f"Tutti i metodi di trasferimento falliti. CCXT: {str(ccxt_error)}, API Nativa: {str(api_error)}"
+                    }
+                    
+        except Exception as e:
+            logger.error(f"Errore durante il trasferimento interno Bitfinex: {str(e)}")
+            return {
+                "success": False,
+                "error": f"Errore durante il trasferimento interno Bitfinex: {str(e)}"
+            }
+    
+    def find_solana_contract(self, api, exchange_name):
+        """Trova il simbolo corretto per il contratto SOL su un exchange specifico"""
+        # Ottieni tutti i futures perpetui
+        all_futures = api.get_perpetual_futures()
+        
+        # Gestisci i formati specifici per exchange
+        if exchange_name == "Bitfinex":
+            # Formati possibili per SOLANA su Bitfinex
+            possible_formats = ["tSOLF0:USTF0", "tSOLF0:USDF0", "tSOL:USTF0", "tSOLF0:UST0"]
+            
+            # Cerca prima nei formati conosciuti
+            for symbol in possible_formats:
+                if symbol in all_futures:
+                    return symbol
+            
+            # Cerca per pattern parziale se non viene trovato nei formati standard
+            for symbol in all_futures:
+                if 'SOL' in symbol.upper() and 'F0:' in symbol:
+                    return symbol
+            
+            # Se non viene trovato, utilizza l'API nativa di Bitfinex come fallback
+            try:
+                from bitfinex_api import BitfinexAPI
+                bitfinex_api = BitfinexAPI()
+                bitfinex_futures = bitfinex_api.get_perpetual_futures()
+                
+                # Controlla nei risultati dell'API nativa
+                for symbol in bitfinex_futures:
+                    if 'SOL' in symbol.upper() and 'F0:' in symbol:
+                        return symbol
+                
+                # Se ancora non trovato, usa il formato predefinito
+                return "tSOLF0:USTF0"
+            except Exception as e:
+                # In caso di errore, usa il formato predefinito
+                return "tSOLF0:USTF0"
+        
+        elif exchange_name == "BitMEX":
+            # Per BitMEX, cerca simboli con SOL
+            for symbol in all_futures:
+                if 'SOL' in symbol.upper() and 'USDT' in symbol.upper():
+                    return symbol
+            
+            # Se non trovato, usa il formato predefinito
+            return "SOLUSDT"
+        
+        elif exchange_name == "ByBit":
+            # Per ByBit, cerca esattamente SOL/USDT o SOLUSDT
+            exact_symbols = ["SOLUSDT", "SOL/USDT"]
+            
+            # Prima prova a trovare i simboli esatti
+            for symbol in exact_symbols:
+                if symbol in all_futures:
+                    return symbol
+            
+            # Cerca rigorosamente il simbolo SOLUSDT, escludendo simboli simili
+            for symbol in all_futures:
+                # Controlla se il simbolo è esattamente SOLUSDT (caso più comune)
+                if symbol == "SOLUSDT":
+                    return symbol
+                # Controlla se il simbolo è in uno di questi formati: SOL-USDT, SOL_USDT
+                elif symbol in ["SOL-USDT", "SOL_USDT"]:
+                    return symbol
+                # Controlla se il simbolo è SOL/USDT (formato con slash)
+                elif symbol == "SOL/USDT":
+                    return symbol
+            
+            # Se non vengono trovati i simboli esatti, fai un controllo intelligente
+            for symbol in all_futures:
+                if (symbol.startswith("SOL") and 
+                    symbol.endswith("USDT") and 
+                    not any(x in symbol.upper() for x in ["SOLO", "SOLAYER", "SOLA"])):
+                    return symbol
+            
+            # Se non è stato trovato nessun simbolo, usa il formato predefinito
+            logger.warning(f"Non è stato trovato alcun simbolo SOL valido su ByBit, utilizzo il formato predefinito SOLUSDT")
+            return "SOLUSDT"
+        
+        # Per altri exchange
+        else:
+            # Cerca simboli con SOL e USDT
+            for symbol in all_futures:
+                if 'SOL' in symbol.upper() and 'USDT' in symbol.upper():
+                    return symbol
+            
+            # Cerca simboli generici con SOL
+            for symbol in all_futures:
+                if 'SOL' in symbol.upper():
+                    return symbol
+            
+            # Se non trovato, usa un formato generico
+            return "SOL/USDT"
+    
+    def check_bitmex_balance(self, required_usdt):
+        """Verifica se c'è sufficiente capitale su BitMEX"""
+        try:
+            api = CCXTAPI('bitmex')
+            balance = api.exchange.fetch_balance()
+            
+            usdt_balance = balance.get('USDT', {}).get('free', 0)
+            
+            if usdt_balance >= required_usdt:
+                st.success(f"✅ BitMEX: Saldo sufficiente ({usdt_balance} USDT)")
+                return {
+                    "success": True,
+                    "available": usdt_balance,
+                    "required": required_usdt,
+                    "sufficient": True
+                }
+            else:
+                st.error(f"❌ BitMEX: Saldo insufficiente ({usdt_balance} < {required_usdt} USDT)")
+                return {
+                    "success": False,
+                    "available": usdt_balance,
+                    "required": required_usdt,
+                    "sufficient": False,
+                    "error": f"Saldo insufficiente: {usdt_balance} USDT disponibili, {required_usdt} USDT richiesti"
+                }
+                
+        except Exception as e:
+            st.error(f"❌ Errore nel controllo saldo BitMEX: {str(e)}")
+            return {
+                "success": False,
+                "error": f"Errore nel controllo saldo BitMEX: {str(e)}"
+            }
+    
+    def check_bybit_balance(self, required_usdt):
+        """Verifica se c'è sufficiente capitale su ByBit"""
+        try:
+            api = CCXTAPI('bybit')
+            
+            balance = api.exchange.fetch_balance()
+            
+            unified_balance = 0
+            funding_balance = 0
+            
+            if 'unified' in balance:
+                unified_balance = balance['unified'].get('USDT', {}).get('free', 0)
+            elif 'USDT' in balance:
+                unified_balance = balance['USDT'].get('free', 0)
+            
+            try:
+                funding_balance_ccxt = api.exchange.fetch_balance({'type': 'funding'})
+                if 'USDT' in funding_balance_ccxt:
+                    funding_balance = funding_balance_ccxt['USDT'].get('free', 0)
+            except Exception:
+                pass
+            
+            if funding_balance == 0:
+                try:
+                    funding_params = {'accountType': 'FUND'}
+                    funding_balance_direct = api.exchange.fetchBalance(funding_params)
+                    if 'USDT' in funding_balance_direct:
+                        funding_balance = funding_balance_direct['USDT'].get('free', 0)
+                except Exception:
+                    pass
+            
+            if funding_balance == 0:
+                try:
+                    wallet_response = api.exchange.private_get_v5_account_wallet_balance({
+                        'accountType': 'FUND'
+                    })
+                    
+                    if wallet_response and 'result' in wallet_response:
+                        for account in wallet_response['result'].get('list', []):
+                            for coin in account.get('coin', []):
+                                if coin.get('coin') == 'USDT':
+                                    funding_balance = float(coin.get('walletBalance', 0))
+                                    break
+                except Exception:
+                    pass
+            
+            if funding_balance == 0:
+                try:
+                    coins_balance = api.exchange.private_get_v5_asset_transfer_query_account_coins_balance({
+                        'accountType': 'FUND',
+                        'coin': 'USDT'
+                    })
+                    
+                    if coins_balance and 'result' in coins_balance:
+                        balance_info = coins_balance['result'].get('balance', [])
+                        for coin_info in balance_info:
+                            if coin_info.get('coin') == 'USDT':
+                                funding_balance = float(coin_info.get('walletBalance', 0))
+                                break
+                except Exception:
+                    pass
+            
+            if funding_balance == 0:
+                try:
+                    all_balances = api.exchange.private_get_v5_account_wallet_balance({})
+                    
+                    if all_balances and 'result' in all_balances:
+                        for account in all_balances['result'].get('list', []):
+                            account_type = account.get('accountType', '')
+                            
+                            for coin in account.get('coin', []):
+                                coin_name = coin.get('coin', '')
+                                wallet_balance = float(coin.get('walletBalance', 0))
+                                
+                                if coin_name == 'USDT' and wallet_balance > 0:
+                                    if account_type == 'FUND':
+                                        funding_balance = wallet_balance
+                except Exception:
+                    pass
+            
+            total_balance = unified_balance + funding_balance
+            
+            st.write(f"**Saldo ByBit:** Unified: {unified_balance} USDT, Funding: {funding_balance} USDT")
+            
+            if unified_balance >= required_usdt:
+                st.success(f"✅ ByBit: Saldo unified sufficiente ({unified_balance} USDT)")
+                return {
+                    "success": True,
+                    "unified_balance": unified_balance,
+                    "funding_balance": funding_balance,
+                    "total_balance": total_balance,
+                    "required": required_usdt,
+                    "transfer_needed": False,
+                    "sufficient": True
+                }
+            
+            elif total_balance >= required_usdt:
+                raw_transfer_amount = required_usdt - unified_balance
+                
+                if unified_balance < 0.01:
+                    transfer_amount = required_usdt
+                else:
+                    transfer_amount = round(raw_transfer_amount, 2)
+                
+                st.warning(f"⚠️ ByBit: Serve trasferimento da funding a unified ({transfer_amount} USDT)")
+                
+                if funding_balance < transfer_amount:
+                    st.error(f"❌ Saldo funding insufficiente per il trasferimento: {funding_balance} < {transfer_amount}")
+                    return {
+                        "success": False,
+                        "error": f"Saldo funding insufficiente: {funding_balance} USDT disponibili, {transfer_amount} USDT richiesti",
+                        "funding_balance": funding_balance,
+                        "transfer_amount": transfer_amount
+                    }
+                
+                st.write(f"🔄 Esecuzione trasferimento interno ByBit di {transfer_amount} USDT")
+                
+                transfer_result = self._bybit_internal_transfer(transfer_amount, 'funding', 'unified')
+                
+                if transfer_result['success']:
+                    st.success(f"✅ Trasferimento completato")
+                    
+                    time.sleep(3)
+                    new_balance = api.exchange.fetch_balance()
+                    new_unified = new_balance.get('USDT', {}).get('free', 0)
+                    if 'unified' in new_balance:
+                        new_unified = new_balance['unified'].get('USDT', {}).get('free', 0)
+                    
+                    if new_unified == 0:
+                        new_unified = unified_balance + transfer_amount
+                    
+                    return {
+                        "success": True,
+                        "unified_balance": new_unified,
+                        "funding_balance": funding_balance - transfer_amount,
+                        "total_balance": total_balance,
+                        "required": required_usdt,
+                        "transfer_needed": True,
+                        "transfer_amount": transfer_amount,
+                        "transfer_completed": True,
+                        "sufficient": True,
+                        "transfer_method": transfer_result.get('method', 'Unknown')
+                    }
+                else:
+                    st.error(f"❌ {transfer_result['error']}")
+                    return {
+                        "success": False,
+                        "error": transfer_result['error'],
+                        "transfer_needed": True,
+                        "transfer_completed": False,
+                        "manual_action_required": True
+                    }
+            
+            else:
+                shortage = required_usdt - total_balance
+                st.error(f"❌ ByBit: Saldo totale insufficiente (mancano {shortage} USDT)")
+                return {
+                    "success": False,
+                    "unified_balance": unified_balance,
+                    "funding_balance": funding_balance,
+                    "total_balance": total_balance,
+                    "required": required_usdt,
+                    "sufficient": False,
+                    "shortage": shortage,
+                    "error": f"Saldo insufficiente: {total_balance} USDT totali, {required_usdt} USDT richiesti"
+                }
+                
+        except Exception as e:
+            st.error(f"❌ Errore nel controllo saldo ByBit: {str(e)}")
+            return {
+                "success": False,
+                "error": f"Errore nel controllo saldo ByBit: {str(e)}"
+            }
+    
+    def check_bitfinex_balance(self, required_usdt):
+        """Verifica se c'è sufficiente capitale su Bitfinex"""
+        try:
+            api = CCXTAPI('bitfinex')
+            
+            balance = api.exchange.fetch_balance()
+            
+            margin_balance = 0
+            exchange_balance = 0
+            funding_balance = 0
+            
+            if 'margin' in balance:
+                margin_balance = balance['margin'].get('USTF0', {}).get('free', 0)
+                if margin_balance == 0:
+                    margin_balance = balance['margin'].get('USDT', {}).get('free', 0)
+            
+            if 'exchange' in balance:
+                exchange_balance = balance['exchange'].get('UST', {}).get('free', 0)
+                if exchange_balance == 0:
+                    exchange_balance = balance['exchange'].get('USDT', {}).get('free', 0)
+            
+            if 'funding' in balance:
+                funding_balance = balance['funding'].get('UST', {}).get('free', 0)
+                if funding_balance == 0:
+                    funding_balance = balance['funding'].get('USDT', {}).get('free', 0)
+            
+            if 'info' in balance:
+                for wallet_info in balance['info']:
+                    if len(wallet_info) >= 3:
+                        wallet_type = wallet_info[0]
+                        currency = wallet_info[1]
+                        balance_amount = float(wallet_info[2])
+                        
+                        if wallet_type == 'margin' and (currency == 'USTF0' or currency == 'USDT') and balance_amount > 0:
+                            margin_balance = balance_amount
+                        
+                        if wallet_type == 'exchange' and (currency == 'UST' or currency == 'USDT') and balance_amount > 0:
+                            exchange_balance = balance_amount
+                            
+                        if wallet_type == 'funding' and (currency == 'UST' or currency == 'USDT') and balance_amount > 0:
+                            funding_balance = balance_amount
+            
+            total_balance = margin_balance + exchange_balance + funding_balance
+            
+            st.write(f"**Saldo Bitfinex:** Margin: {margin_balance} USDT, Exchange: {exchange_balance} USDT, Funding: {funding_balance} USDT")
+            
+            if margin_balance >= required_usdt:
+                st.success(f"✅ Bitfinex: Saldo margin sufficiente ({margin_balance} USDT)")
+                return {
+                    "success": True,
+                    "margin_balance": margin_balance,
+                    "exchange_balance": exchange_balance,
+                    "funding_balance": funding_balance,
+                    "total_balance": total_balance,
+                    "required": required_usdt,
+                    "transfer_needed": False,
+                    "sufficient": True
+                }
+            
+            elif exchange_balance >= (required_usdt - margin_balance):
+                raw_transfer_amount = required_usdt - margin_balance
+                
+                if margin_balance < 0.01:
+                    transfer_amount = required_usdt
+                else:
+                    transfer_amount = round(raw_transfer_amount, 2)
+                
+                st.warning(f"⚠️ Bitfinex: Serve trasferimento da exchange a margin ({transfer_amount} USDT)")
+                
+                st.write(f"🔄 Esecuzione trasferimento interno Bitfinex di {transfer_amount} USDT")
+                
+                transfer_result = self._bitfinex_internal_transfer(transfer_amount, 'exchange', 'margin')
+                
+                if transfer_result['success']:
+                    st.success(f"✅ Trasferimento completato")
+                    
+                    time.sleep(3)
+                    new_balance = api.exchange.fetch_balance()
+                    
+                    new_margin = 0
+                    if 'margin' in new_balance:
+                        new_margin = new_balance['margin'].get('USTF0', {}).get('free', 0)
+                        if new_margin == 0:
+                            new_margin = new_balance['margin'].get('USDT', {}).get('free', 0)
+                    
+                    if new_margin == 0:
+                        new_margin = margin_balance + transfer_amount
+                    
+                    return {
+                        "success": True,
+                        "margin_balance": new_margin,
+                        "exchange_balance": exchange_balance - transfer_amount,
+                        "funding_balance": funding_balance,
+                        "total_balance": total_balance,
+                        "required": required_usdt,
+                        "transfer_needed": True,
+                        "transfer_amount": transfer_amount,
+                        "transfer_completed": True,
+                        "sufficient": True
+                    }
+                else:
+                    st.error(f"❌ {transfer_result['error']}")
+                    return {
+                        "success": False,
+                        "error": transfer_result['error'],
+                        "transfer_needed": True,
+                        "transfer_completed": False,
+                        "manual_action_required": True
+                    }
+            
+            elif funding_balance >= (required_usdt - margin_balance) and exchange_balance + funding_balance >= (required_usdt - margin_balance):
+                raw_transfer_amount = required_usdt - margin_balance
+                
+                if margin_balance < 0.01:
+                    transfer_amount = required_usdt
+                else:
+                    transfer_amount = round(raw_transfer_amount, 2)
+                    
+                st.warning(f"⚠️ Bitfinex: Servono due trasferimenti: funding -> exchange -> margin ({transfer_amount} USDT)")
+                
+                funding_transfer = min(transfer_amount, funding_balance)
+                funding_transfer = round(funding_transfer, 2)
+                
+                st.write(f"🔄 Trasferimento 1/2: funding → exchange ({funding_transfer} USDT)")
+                
+                transfer_result1 = self._bitfinex_internal_transfer(funding_transfer, 'funding', 'exchange')
+                
+                if not transfer_result1['success']:
+                    st.error(f"❌ {transfer_result1['error']}")
+                    return {
+                        "success": False,
+                        "error": transfer_result1['error'],
+                        "step": "funding_to_exchange",
+                        "transfer_needed": True,
+                        "transfer_completed": False,
+                        "manual_action_required": True
+                    }
+                
+                st.success(f"✅ Primo trasferimento completato")
+                
+                st.info("⏱️ Attesa settlement (10 sec)")
+                time.sleep(10)
+                
+                exchange_balance += funding_transfer
+                funding_balance -= funding_transfer
+                
+                st.write(f"🔄 Trasferimento 2/2: exchange → margin ({transfer_amount} USDT)")
+                
+                transfer_result2 = self._bitfinex_internal_transfer(transfer_amount, 'exchange', 'margin')
+                
+                if transfer_result2['success']:
+                    st.success(f"✅ Secondo trasferimento completato")
+                    
+                    time.sleep(3)
+                    new_balance = api.exchange.fetch_balance()
+                    
+                    new_margin = 0
+                    if 'margin' in new_balance:
+                        new_margin = new_balance['margin'].get('USTF0', {}).get('free', 0)
+                        if new_margin == 0:
+                            new_margin = new_balance['margin'].get('USDT', {}).get('free', 0)
+                    
+                    if new_margin == 0:
+                        new_margin = margin_balance + transfer_amount
+                    
+                    return {
+                        "success": True,
+                        "margin_balance": new_margin,
+                        "exchange_balance": exchange_balance - transfer_amount,
+                        "funding_balance": funding_balance,
+                        "total_balance": total_balance,
+                        "required": required_usdt,
+                        "transfer_needed": True,
+                        "transfer_amount": transfer_amount,
+                        "transfer_completed": True,
+                        "sufficient": True
+                    }
+                else:
+                    st.error(f"❌ {transfer_result2['error']}")
+                    return {
+                        "success": False,
+                        "error": transfer_result2['error'],
+                        "step": "exchange_to_margin",
+                        "transfer_needed": True,
+                        "transfer_completed": False,
+                        "manual_action_required": True
+                    }
+            
+            else:
+                shortage = required_usdt - total_balance
+                st.error(f"❌ Bitfinex: Saldo totale insufficiente (mancano {shortage} USDT)")
+                return {
+                    "success": False,
+                    "margin_balance": margin_balance,
+                    "exchange_balance": exchange_balance,
+                    "funding_balance": funding_balance,
+                    "total_balance": total_balance,
+                    "required": required_usdt,
+                    "sufficient": False,
+                    "shortage": shortage,
+                    "error": f"Saldo insufficiente: {total_balance} USDT totali, {required_usdt} USDT richiesti"
+               }
+               
+        except Exception as e:
+            st.error(f"❌ Errore nel controllo saldo Bitfinex: {str(e)}")
+            return {
+                "success": False,
+                "error": f"Errore nel controllo saldo Bitfinex: {str(e)}"
+            }
+    
+    def check_capital_requirements(self, exchange_long, exchange_short, required_usdt_per_position):
+        """
+        Controlla che ci sia capitale sufficiente su entrambi gli exchange
+        
+        Args:
+            exchange_long: Nome dell'exchange per posizione LONG
+            exchange_short: Nome dell'exchange per posizione SHORT
+            required_usdt_per_position: USDT richiesti per exchange
+        
+        Returns:
+            dict: Risultato della verifica del capitale
+        """
+        results = {
+            "long_exchange": {"name": exchange_long, "check": None},
+            "short_exchange": {"name": exchange_short, "check": None},
+            "overall_success": False
+        }
+        
+        # Verifica capitale exchange LONG
+        if exchange_long == "BitMEX":
+            results["long_exchange"]["check"] = self.check_bitmex_balance(required_usdt_per_position)
+        elif exchange_long == "ByBit":
+            results["long_exchange"]["check"] = self.check_bybit_balance(required_usdt_per_position)
+        elif exchange_long == "Bitfinex":
+            results["long_exchange"]["check"] = self.check_bitfinex_balance(required_usdt_per_position)
+        else:
+            st.warning(f"⚠️ Controllo capitale per {exchange_long} non ancora implementato")
+            results["long_exchange"]["check"] = {"success": False, "error": "Exchange non supportato"}
+        
+        # Verifica capitale exchange SHORT
+        if exchange_short == "BitMEX":
+            results["short_exchange"]["check"] = self.check_bitmex_balance(required_usdt_per_position)
+        elif exchange_short == "ByBit":
+            results["short_exchange"]["check"] = self.check_bybit_balance(required_usdt_per_position)
+        elif exchange_short == "Bitfinex":
+            results["short_exchange"]["check"] = self.check_bitfinex_balance(required_usdt_per_position)
+        else:
+            st.warning(f"⚠️ Controllo capitale per {exchange_short} non ancora implementato")
+            results["short_exchange"]["check"] = {"success": False, "error": "Exchange non supportato"}
+        
+        # Verifica se entrambi hanno saldo sufficiente
+        long_ok = results["long_exchange"]["check"].get("success", False)
+        short_ok = results["short_exchange"]["check"].get("success", False)
+        
+        results["overall_success"] = long_ok and short_ok
+        
+        # Visualizza riepilogo
+        st.write("### 📊 Riepilogo Controllo Capitale")
+        if results["overall_success"]:
+            st.success("✅ **Capitale sufficiente su entrambi gli exchange**")
+        else:
+            st.error("❌ **Capitale insufficiente o errori rilevati**")
+            
+            if not long_ok:
+                error_msg = results["long_exchange"]["check"].get("error", "Errore sconosciuto")
+                st.error(f"• LONG ({exchange_long}): {error_msg}")
+                
+            if not short_ok:
+                error_msg = results["short_exchange"]["check"].get("error", "Errore sconosciuto")
+                st.error(f"• SHORT ({exchange_short}): {error_msg}")
+        
+        return results
     
     def open_initial_positions(self):
         """
         Apre le posizioni iniziali sugli exchange configurati.
-        Esegue solo i controlli necessari (capitale sufficiente) e apre immediatamente le posizioni.
+        Esegue i controlli necessari (capitale sufficiente) e apre le posizioni.
         """
         logger.info(f"Apertura posizioni iniziali per l'utente {self.user_id}")
         
@@ -55,76 +872,196 @@ class EntryManager:
             logger.info(f"Posizioni già aperte: {existing_positions['count']} trovate")
             return {"success": True, "already_open": True, "positions": existing_positions["positions"]}
         
-        # Verifica il capitale disponibile su ciascun exchange
-        capital_check = self._check_available_capital(exchanges, position_size)
-        if not capital_check["success"]:
-            logger.error(f"Capitale insufficiente: {capital_check['error']}")
-            return {"success": False, "error": capital_check["error"]}
+        exchange_long = exchanges[0]
+        exchange_short = exchanges[1]
         
-        # Apri le posizioni long e short su exchange diversi
-        positions = []
+        # Verifica API keys
+        if not (os.getenv(f"{exchange_long.upper()}_API_KEY") and os.getenv(f"{exchange_long.upper()}_API_SECRET")):
+            logger.error(f"API Key e Secret per {exchange_long} non configurati")
+            return {"success": False, "error": f"API Key e Secret per {exchange_long} non configurati"}
         
+        if not (os.getenv(f"{exchange_short.upper()}_API_KEY") and os.getenv(f"{exchange_short.upper()}_API_SECRET")):
+            logger.error(f"API Key e Secret per {exchange_short} non configurati")
+            return {"success": False, "error": f"API Key e Secret per {exchange_short} non configurati"}
+        
+        # Calcola la size SOL
+        sol_info = self.calculate_sol_size(position_size)
+        if not sol_info["success"]:
+            logger.error(f"Errore nel calcolo della size SOL: {sol_info['error']}")
+            return {"success": False, "error": sol_info["error"]}
+        
+        sol_size = sol_info["sol_size"]
+        
+        # Inizializza le API per ciascun exchange
         try:
-            # Primo exchange: posizione LONG
-            long_exchange = exchanges[0]
-            long_result = self.exchange.open_position(
-                long_exchange, 
-                symbol, 
-                "long", 
-                position_size
-            )
+            exchange_id_long = normalize_exchange_id(exchange_long)
+            exchange_id_short = normalize_exchange_id(exchange_short)
             
-            if long_result["success"]:
-                logger.info(f"Posizione LONG aperta su {long_exchange}")
-                self._save_position_to_db(long_result)
-                positions.append(long_result)
+            api_long = CCXTAPI(exchange_id_long)
+            api_short = CCXTAPI(exchange_id_short)
+            
+            # Trova i simboli corretti per SOL su ciascun exchange
+            symbol_long = self.find_solana_contract(api_long, exchange_long)
+            symbol_short = self.find_solana_contract(api_short, exchange_short)
+            
+            logger.info(f"Simboli identificati: LONG={symbol_long} su {exchange_long}, SHORT={symbol_short} su {exchange_short}")
+            
+            # Adatta la size in base all'exchange
+            if exchange_long == "BitMEX":
+                adjusted_long_size = int(sol_size * 10000)
+                adjusted_long_size = max(adjusted_long_size, 1000)
+                adjusted_long_size = round(adjusted_long_size / 100) * 100
+                logger.info(f"Conversione LONG BitMEX: {sol_size} SOL → {adjusted_long_size} contratti")
             else:
-                logger.error(f"Errore nell'apertura della posizione LONG: {long_result['error']}")
-                return {"success": False, "error": f"Errore posizione LONG: {long_result['error']}"}
+                adjusted_long_size = sol_size
             
-            # Secondo exchange: posizione SHORT
-            short_exchange = exchanges[1]
-            short_result = self.exchange.open_position(
-                short_exchange, 
-                symbol, 
-                "short", 
-                position_size
-            )
-            
-            if short_result["success"]:
-                logger.info(f"Posizione SHORT aperta su {short_exchange}")
-                self._save_position_to_db(short_result)
-                positions.append(short_result)
+            if exchange_short == "BitMEX":
+                adjusted_short_size = -int(sol_size * 10000)
+                adjusted_short_size = min(adjusted_short_size, -1000)
+                adjusted_short_size = round(adjusted_short_size / 100) * 100
+                logger.info(f"Conversione SHORT BitMEX: {sol_size} SOL → {abs(adjusted_short_size)} contratti")
             else:
-                # Se la posizione short fallisce, chiudi anche la long per evitare sbilanciamenti
-                logger.error(f"Errore nell'apertura della posizione SHORT: {short_result['error']}")
-                self.exchange.close_position(long_exchange, symbol)
-                return {"success": False, "error": f"Errore posizione SHORT: {short_result['error']}"}
+                adjusted_short_size = -sol_size
             
-            # Log di successo
-            logger.info(f"Posizioni aperte con successo: LONG su {long_exchange}, SHORT su {short_exchange}")
-            return {"success": True, "positions": positions}
+            # Esegui gli ordini
+            positions = []
+            
+            try:
+                # Ordine LONG
+                long_order = api_long.submit_order(
+                    symbol=symbol_long,
+                    amount=adjusted_long_size,
+                    price=None,  # Market order
+                    market=True
+                )
+                
+                logger.info(f"Ordine LONG inviato con successo: {long_order}")
+                
+                # Salva informazioni posizione LONG
+                long_position = {
+                    "position_id": long_order.get('id', str(uuid.uuid4())),
+                    "user_id": self.user_id,
+                    "exchange": exchange_long,
+                    "symbol": symbol_long,
+                    "side": "long",
+                    "size": adjusted_long_size,
+                    "details": long_order
+                }
+                
+                positions.append(long_position)
+                if self.db:
+                    self._save_position_to_db(long_position)
+                
+            except Exception as e:
+                error_msg = str(e)
+                logger.error(f"Errore nell'invio dell'ordine LONG: {error_msg}")
+                
+                if exchange_long == "BitMEX" and "insufficient available balance" in error_msg.lower():
+                    return {"success": False, "error": f"Saldo insufficiente su BitMEX per aprire la posizione LONG"}
+                
+                return {"success": False, "error": f"Errore nell'invio dell'ordine LONG: {error_msg}"}
+            
+            try:
+                # Ordine SHORT
+                short_order = api_short.submit_order(
+                    symbol=symbol_short,
+                    amount=adjusted_short_size,
+                    price=None,  # Market order
+                    market=True
+                )
+                
+                logger.info(f"Ordine SHORT inviato con successo: {short_order}")
+                
+                # Salva informazioni posizione SHORT
+                short_position = {
+                    "position_id": short_order.get('id', str(uuid.uuid4())),
+                    "user_id": self.user_id,
+                    "exchange": exchange_short,
+                    "symbol": symbol_short,
+                    "side": "short",
+                    "size": abs(adjusted_short_size),
+                    "details": short_order
+                }
+                
+                positions.append(short_position)
+                if self.db:
+                    self._save_position_to_db(short_position)
+                
+            except Exception as e:
+                error_msg = str(e)
+                logger.error(f"Errore nell'invio dell'ordine SHORT: {error_msg}")
+                
+                # Se l'ordine SHORT fallisce, prova a chiudere anche la posizione LONG
+                try:
+                    logger.warning("Tentativo di chiusura posizione LONG dopo fallimento SHORT")
+                    api_long.close_position(symbol_long)
+                except Exception as close_error:
+                    logger.error(f"Errore anche nella chiusura della posizione LONG: {str(close_error)}")
+                
+                if exchange_short == "BitMEX" and "insufficient available balance" in error_msg.lower():
+                    return {"success": False, "error": f"Saldo insufficiente su BitMEX per aprire la posizione SHORT"}
+                
+                return {
+                    "success": False, 
+                    "error": f"Errore nell'invio dell'ordine SHORT: {error_msg}",
+                    "note": "L'ordine LONG è stato eseguito ma si è tentato di chiuderlo"
+                }
+            
+            # Operazione completata con successo
+            return {
+                "success": True,
+                "positions": positions,
+                "details": {
+                    "sol_size": sol_size,
+                    "long_exchange": exchange_long,
+                    "short_exchange": exchange_short,
+                    "long_symbol": symbol_long,
+                    "short_symbol": symbol_short,
+                    "adjusted_long_size": adjusted_long_size,
+                    "adjusted_short_size": adjusted_short_size
+                }
+            }
             
         except Exception as e:
-            logger.error(f"Errore nell'apertura delle posizioni iniziali: {str(e)}")
-            # Tenta di chiudere eventuali posizioni aperte parzialmente
-            self._close_all_positions(exchanges, symbol)
-            return {"success": False, "error": str(e)}
+            logger.error(f"Errore generale nell'apertura delle posizioni: {str(e)}")
+            return {"success": False, "error": f"Errore generale: {str(e)}"}
     
     def _check_existing_positions(self):
         """Verifica se ci sono già posizioni aperte per questo utente"""
         try:
-            # Recupera posizioni dal database
-            positions = self.db.get_user_positions(self.user_id)
+            # Se abbiamo un database, verifica le posizioni lì
+            if self.db:
+                positions = self.db.get_user_positions(self.user_id)
+                if positions:
+                    return {
+                        "has_positions": True, 
+                        "count": len(positions),
+                        "positions": positions
+                    }
             
-            # Controlla anche sugli exchange
-            exchange_positions = self.exchange.get_open_positions()
+            # Altrimenti verifica posizioni direttamente sugli exchange
+            positions = []
+            exchanges = self.config["exchanges"]
             
-            if positions or (exchange_positions["success"] and exchange_positions["positions"]):
+            for exchange_name in exchanges:
+                try:
+                    exchange_id = normalize_exchange_id(exchange_name)
+                    api = CCXTAPI(exchange_id)
+                    exchange_positions = api.get_open_positions()
+                    
+                    if exchange_positions and len(exchange_positions) > 0:
+                        for pos in exchange_positions:
+                            # Aggiungi informazioni sull'exchange
+                            pos["exchange"] = exchange_name
+                            positions.append(pos)
+                except Exception as e:
+                    logger.warning(f"Impossibile recuperare posizioni da {exchange_name}: {str(e)}")
+            
+            if positions:
                 return {
-                    "has_positions": True, 
-                    "count": len(positions) if positions else len(exchange_positions["positions"]),
-                    "positions": positions or exchange_positions["positions"]
+                    "has_positions": True,
+                    "count": len(positions),
+                    "positions": positions
                 }
             
             return {"has_positions": False, "count": 0, "positions": []}
@@ -133,63 +1070,40 @@ class EntryManager:
             logger.error(f"Errore nel controllo delle posizioni esistenti: {str(e)}")
             return {"has_positions": False, "count": 0, "positions": []}
     
-    def _check_available_capital(self, exchanges, position_size):
-        """Verifica che ci sia capitale sufficiente su tutti gli exchange"""
-        for exchange_id in exchanges:
-            try:
-                # Recupera il saldo
-                balance = self.exchange.get_account_balance(exchange_id)
-                
-                if not balance["success"]:
-                    return {"success": False, "error": f"Impossibile recuperare il saldo su {exchange_id}"}
-                
-                # Verifica che ci sia abbastanza capitale disponibile
-                available_usdt = balance["balance"].get("USDT", {}).get("free", 0)
-                
-                # Calcola il capitale minimo richiesto (posizione * leva * margine di sicurezza)
-                # In questo caso assumiamo una leva di 3x e un margine di sicurezza del 50%
-                min_required = position_size * 1.5  # Considera margine di sicurezza
-                
-                if available_usdt < min_required:
-                    return {
-                        "success": False, 
-                        "error": f"Capitale insufficiente su {exchange_id}: {available_usdt} USDT (richiesto: {min_required})"
-                    }
-                
-                logger.info(f"Capitale disponibile su {exchange_id}: {available_usdt} USDT")
-                
-            except Exception as e:
-                return {"success": False, "error": f"Errore nel controllo del capitale su {exchange_id}: {str(e)}"}
-        
-        return {"success": True}
-    
     def _save_position_to_db(self, position_data):
         """Salva una posizione nel database"""
         try:
+            if not self.db:
+                logger.warning("Database non disponibile, impossibile salvare la posizione")
+                return False
+                
             position_doc = {
                 "position_id": position_data["position_id"],
                 "user_id": self.user_id,
-                "bot_id": position_data.get("bot_id", ""),
                 "exchange": position_data["exchange"],
                 "symbol": position_data["symbol"],
                 "side": position_data["side"],
                 "size": position_data["size"],
                 "entry_price": position_data.get("details", {}).get("entryPrice", 0),
-                "leverage": position_data.get("details", {}).get("leverage", 3),
+                "leverage": position_data.get("details", {}).get("leverage", 5),
                 "margin_used": position_data.get("details", {}).get("positionMargin", 0),
-                "current_price": position_data.get("details", {}).get("markPrice", 0)
+                "current_price": position_data.get("details", {}).get("markPrice", 0),
+                "timestamp": datetime.now(timezone.utc).timestamp(),
+                "status": "open"
             }
             
             self.db.save_position(position_doc)
             logger.info(f"Posizione salvata nel database: {position_data['position_id']}")
+            return True
             
         except Exception as e:
             logger.error(f"Errore nel salvataggio della posizione: {str(e)}")
-    
-    def _close_all_positions(self, exchanges, symbol):
-        """Chiude tutte le posizioni in caso di errore"""
-        for exchange_id in exchanges:
-            try:
-                self.exchange.close_position(exchange_id, symbol)
-            except Exception as e:
-                logger.error(f"Errore nella chiusura di emergenza della posizione su {exchange_id}: {str(e)}") 
+            return False
+
+# Funzione di utilità per normalizzare ID exchange
+def normalize_exchange_id(exchange_name):
+    """Converte il nome dell'exchange nel formato CCXT corrispondente"""
+    if exchange_name == "BitMEX":
+        return "bitmex"
+    else:
+        return exchange_name.lower() 
