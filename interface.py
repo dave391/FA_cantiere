@@ -25,12 +25,14 @@ st.set_page_config(
 
 def get_bot_attivi():
     """Recupera informazioni sui bot attivi dalla sessione"""
+    bot_attivi = []
+    
     if 'trading_system' in st.session_state and st.session_state.trading_system:
         # Recupera lo stato del bot
         status = st.session_state.trading_system.get_status()
         
-        if status["success"]:
-            return [{
+        if status.get("success", False):
+            bot_attivi.append({
                 "id": "1",
                 "user_id": status.get("user_id", "utente"),
                 "running": status.get("active", False),
@@ -38,16 +40,16 @@ def get_bot_attivi():
                 "positions": status.get("positions", []),
                 "pnl": sum([float(p.get("unrealizedPnl", 0)) for p in status.get("positions", [])]),
                 "last_updated": status.get("last_updated", datetime.now().isoformat())
-            }]
-        
-    return []
+            })
+    
+    return bot_attivi
 
 def ferma_bot(bot_id):
     """Ferma un bot attivo"""
     if 'trading_system' in st.session_state and st.session_state.trading_system:
         result = st.session_state.trading_system.stop_bot()
         
-        if result["success"]:
+        if result.get("success", False):
             st.session_state.bot_running = False
             st.session_state.trading_system = None
             return True

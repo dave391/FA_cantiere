@@ -110,6 +110,21 @@ class TradingSystem:
     def _inizializza_componenti(self):
         """Inizializza i componenti del sistema di trading"""
         try:
+            # Inizializza database e exchange REALI
+            try:
+                from database.mongo_manager import MongoManager
+                from api.exchange_manager import ExchangeManager
+                
+                self.db = MongoManager()
+                self.exchange = ExchangeManager(self.user_id)
+                logger.info("Database e exchange inizializzati")
+            except Exception as e:
+                logger.error(f"Errore inizializzazione database/exchange: {e}")
+                # Fallback senza database per testing
+                self.db = None
+                self.exchange = None
+                logger.warning("Usando modalità senza database/exchange (simulazione)")
+            
             # Inizializza i componenti core
             self.entry_manager = EntryManager(
                 user_id=self.user_id,

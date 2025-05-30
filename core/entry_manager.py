@@ -10,7 +10,6 @@ import math
 import os
 from datetime import datetime, timezone
 import sys
-import streamlit as st
 from dotenv import load_dotenv
 from ccxt_api import CCXTAPI
 
@@ -378,7 +377,7 @@ class EntryManager:
             usdt_balance = balance.get('USDT', {}).get('free', 0)
             
             if usdt_balance >= required_usdt:
-                st.success(f"✅ BitMEX: Saldo sufficiente ({usdt_balance} USDT)")
+                logger.info(f"BitMEX: Saldo sufficiente ({usdt_balance} USDT)")
                 return {
                     "success": True,
                     "available": usdt_balance,
@@ -386,7 +385,7 @@ class EntryManager:
                     "sufficient": True
                 }
             else:
-                st.error(f"❌ BitMEX: Saldo insufficiente ({usdt_balance} < {required_usdt} USDT)")
+                logger.error(f"BitMEX: Saldo insufficiente ({usdt_balance} < {required_usdt} USDT)")
                 return {
                     "success": False,
                     "available": usdt_balance,
@@ -396,7 +395,7 @@ class EntryManager:
                 }
                 
         except Exception as e:
-            st.error(f"❌ Errore nel controllo saldo BitMEX: {str(e)}")
+            logger.error(f"Errore nel controllo saldo BitMEX: {str(e)}")
             return {
                 "success": False,
                 "error": f"Errore nel controllo saldo BitMEX: {str(e)}"
@@ -484,10 +483,10 @@ class EntryManager:
             
             total_balance = unified_balance + funding_balance
             
-            st.write(f"**Saldo ByBit:** Unified: {unified_balance} USDT, Funding: {funding_balance} USDT")
+            logger.info(f"Saldo ByBit: Unified: {unified_balance} USDT, Funding: {funding_balance} USDT")
             
             if unified_balance >= required_usdt:
-                st.success(f"✅ ByBit: Saldo unified sufficiente ({unified_balance} USDT)")
+                logger.info(f"ByBit: Saldo unified sufficiente ({unified_balance} USDT)")
                 return {
                     "success": True,
                     "unified_balance": unified_balance,
@@ -506,10 +505,10 @@ class EntryManager:
                 else:
                     transfer_amount = round(raw_transfer_amount, 2)
                 
-                st.warning(f"⚠️ ByBit: Serve trasferimento da funding a unified ({transfer_amount} USDT)")
+                logger.warning(f"ByBit: Serve trasferimento da funding a unified ({transfer_amount} USDT)")
                 
                 if funding_balance < transfer_amount:
-                    st.error(f"❌ Saldo funding insufficiente per il trasferimento: {funding_balance} < {transfer_amount}")
+                    logger.error(f"Saldo funding insufficiente per il trasferimento: {funding_balance} < {transfer_amount}")
                     return {
                         "success": False,
                         "error": f"Saldo funding insufficiente: {funding_balance} USDT disponibili, {transfer_amount} USDT richiesti",
@@ -517,12 +516,12 @@ class EntryManager:
                         "transfer_amount": transfer_amount
                     }
                 
-                st.write(f"🔄 Esecuzione trasferimento interno ByBit di {transfer_amount} USDT")
+                logger.info(f"Esecuzione trasferimento interno ByBit di {transfer_amount} USDT")
                 
                 transfer_result = self._bybit_internal_transfer(transfer_amount, 'funding', 'unified')
                 
                 if transfer_result['success']:
-                    st.success(f"✅ Trasferimento completato")
+                    logger.info(f"Trasferimento completato con successo")
                     
                     time.sleep(3)
                     new_balance = api.exchange.fetch_balance()
@@ -546,7 +545,7 @@ class EntryManager:
                         "transfer_method": transfer_result.get('method', 'Unknown')
                     }
                 else:
-                    st.error(f"❌ {transfer_result['error']}")
+                    logger.error(f"Errore trasferimento: {transfer_result['error']}")
                     return {
                         "success": False,
                         "error": transfer_result['error'],
@@ -557,20 +556,20 @@ class EntryManager:
             
             else:
                 shortage = required_usdt - total_balance
-                st.error(f"❌ ByBit: Saldo totale insufficiente (mancano {shortage} USDT)")
+                logger.error(f"ByBit: Saldo totale insufficiente (mancano {shortage} USDT)")
                 return {
                     "success": False,
                     "unified_balance": unified_balance,
                     "funding_balance": funding_balance,
                     "total_balance": total_balance,
                     "required": required_usdt,
-                    "sufficient": False,
                     "shortage": shortage,
-                    "error": f"Saldo insufficiente: {total_balance} USDT totali, {required_usdt} USDT richiesti"
+                    "sufficient": False,
+                    "error": f"Saldo totale insufficiente: {total_balance} USDT disponibili, {required_usdt} USDT richiesti (mancano {shortage} USDT)"
                 }
                 
         except Exception as e:
-            st.error(f"❌ Errore nel controllo saldo ByBit: {str(e)}")
+            logger.error(f"Errore nel controllo saldo ByBit: {str(e)}")
             return {
                 "success": False,
                 "error": f"Errore nel controllo saldo ByBit: {str(e)}"
@@ -583,47 +582,35 @@ class EntryManager:
             
             balance = api.exchange.fetch_balance()
             
-            margin_balance = 0
-            exchange_balance = 0
-            funding_balance = 0
+            margin_balance = balance.get('margin', {}).get('USDT', {}).get('free', 0) or balance.get('margin', {}).get('UST', {}).get('free', 0)
+            exchange_balance = balance.get('exchange', {}).get('USDT', {}).get('free', 0) or balance.get('exchange', {}).get('UST', {}).get('free', 0)
+            funding_balance = balance.get('funding', {}).get('USDT', {}).get('free', 0) or balance.get('funding', {}).get('UST', {}).get('free', 0)
             
-            if 'margin' in balance:
-                margin_balance = balance['margin'].get('USTF0', {}).get('free', 0)
-                if margin_balance == 0:
-                    margin_balance = balance['margin'].get('USDT', {}).get('free', 0)
+            # Gestisci il caso in cui margin/exchange non siano dizionari nidificati
+            if margin_balance == 0:
+                for currency in ['USDT', 'UST']:
+                    if currency in balance:
+                        for wallet_type in ['margin', 'exchange', 'funding']:
+                            if wallet_type in balance[currency]:
+                                wallet_balance = balance[currency][wallet_type].get('free', 0)
+                                if wallet_type == 'margin':
+                                    margin_balance = wallet_balance
+                                elif wallet_type == 'exchange':
+                                    exchange_balance = wallet_balance
+                                elif wallet_type == 'funding':
+                                    funding_balance = wallet_balance
             
-            if 'exchange' in balance:
-                exchange_balance = balance['exchange'].get('UST', {}).get('free', 0)
-                if exchange_balance == 0:
-                    exchange_balance = balance['exchange'].get('USDT', {}).get('free', 0)
-            
-            if 'funding' in balance:
-                funding_balance = balance['funding'].get('UST', {}).get('free', 0)
-                if funding_balance == 0:
-                    funding_balance = balance['funding'].get('USDT', {}).get('free', 0)
-            
-            if 'info' in balance:
-                for wallet_info in balance['info']:
-                    if len(wallet_info) >= 3:
-                        wallet_type = wallet_info[0]
-                        currency = wallet_info[1]
-                        balance_amount = float(wallet_info[2])
-                        
-                        if wallet_type == 'margin' and (currency == 'USTF0' or currency == 'USDT') and balance_amount > 0:
-                            margin_balance = balance_amount
-                        
-                        if wallet_type == 'exchange' and (currency == 'UST' or currency == 'USDT') and balance_amount > 0:
-                            exchange_balance = balance_amount
-                            
-                        if wallet_type == 'funding' and (currency == 'UST' or currency == 'USDT') and balance_amount > 0:
-                            funding_balance = balance_amount
+            # Controlla anche eventuali wallet "swap"
+            swap_balance = balance.get('swap', {}).get('USDT', {}).get('free', 0) or balance.get('swap', {}).get('UST', {}).get('free', 0)
+            if swap_balance > 0:
+                exchange_balance += swap_balance
             
             total_balance = margin_balance + exchange_balance + funding_balance
             
-            st.write(f"**Saldo Bitfinex:** Margin: {margin_balance} USDT, Exchange: {exchange_balance} USDT, Funding: {funding_balance} USDT")
+            logger.info(f"Saldo Bitfinex: Margin: {margin_balance} USDT, Exchange: {exchange_balance} USDT, Funding: {funding_balance} USDT")
             
             if margin_balance >= required_usdt:
-                st.success(f"✅ Bitfinex: Saldo margin sufficiente ({margin_balance} USDT)")
+                logger.info(f"Bitfinex: Saldo margin sufficiente ({margin_balance} USDT)")
                 return {
                     "success": True,
                     "margin_balance": margin_balance,
@@ -635,38 +622,22 @@ class EntryManager:
                     "sufficient": True
                 }
             
-            elif exchange_balance >= (required_usdt - margin_balance):
-                raw_transfer_amount = required_usdt - margin_balance
+            elif exchange_balance >= required_usdt:
+                # Trasferimento da exchange a margin
+                transfer_amount = required_usdt
                 
-                if margin_balance < 0.01:
-                    transfer_amount = required_usdt
-                else:
-                    transfer_amount = round(raw_transfer_amount, 2)
-                
-                st.warning(f"⚠️ Bitfinex: Serve trasferimento da exchange a margin ({transfer_amount} USDT)")
-                
-                st.write(f"🔄 Esecuzione trasferimento interno Bitfinex di {transfer_amount} USDT")
+                logger.warning(f"Bitfinex: Serve trasferimento da exchange a margin ({transfer_amount} USDT)")
+                logger.info(f"Esecuzione trasferimento interno Bitfinex di {transfer_amount} USDT")
                 
                 transfer_result = self._bitfinex_internal_transfer(transfer_amount, 'exchange', 'margin')
                 
                 if transfer_result['success']:
-                    st.success(f"✅ Trasferimento completato")
+                    logger.info(f"Trasferimento completato con successo")
                     
-                    time.sleep(3)
-                    new_balance = api.exchange.fetch_balance()
-                    
-                    new_margin = 0
-                    if 'margin' in new_balance:
-                        new_margin = new_balance['margin'].get('USTF0', {}).get('free', 0)
-                        if new_margin == 0:
-                            new_margin = new_balance['margin'].get('USDT', {}).get('free', 0)
-                    
-                    if new_margin == 0:
-                        new_margin = margin_balance + transfer_amount
-                    
+                    # Aggiorna i saldi dopo il trasferimento
                     return {
                         "success": True,
-                        "margin_balance": new_margin,
+                        "margin_balance": margin_balance + transfer_amount,
                         "exchange_balance": exchange_balance - transfer_amount,
                         "funding_balance": funding_balance,
                         "total_balance": total_balance,
@@ -674,10 +645,11 @@ class EntryManager:
                         "transfer_needed": True,
                         "transfer_amount": transfer_amount,
                         "transfer_completed": True,
-                        "sufficient": True
+                        "sufficient": True,
+                        "transfer_type": "exchange_to_margin"
                     }
                 else:
-                    st.error(f"❌ {transfer_result['error']}")
+                    logger.error(f"Errore trasferimento: {transfer_result['error']}")
                     return {
                         "success": False,
                         "error": transfer_result['error'],
@@ -686,87 +658,76 @@ class EntryManager:
                         "manual_action_required": True
                     }
             
-            elif funding_balance >= (required_usdt - margin_balance) and exchange_balance + funding_balance >= (required_usdt - margin_balance):
-                raw_transfer_amount = required_usdt - margin_balance
+            elif funding_balance >= required_usdt and exchange_balance < required_usdt and margin_balance < required_usdt:
+                # In Bitfinex, non possiamo trasferire direttamente da funding a margin
+                # Dobbiamo prima trasferire da funding a exchange, poi da exchange a margin
+                transfer_amount = required_usdt
                 
-                if margin_balance < 0.01:
-                    transfer_amount = required_usdt
-                else:
-                    transfer_amount = round(raw_transfer_amount, 2)
-                    
-                st.warning(f"⚠️ Bitfinex: Servono due trasferimenti: funding -> exchange -> margin ({transfer_amount} USDT)")
+                logger.warning(f"Bitfinex: Servono due trasferimenti: funding -> exchange -> margin ({transfer_amount} USDT)")
                 
-                funding_transfer = min(transfer_amount, funding_balance)
-                funding_transfer = round(funding_transfer, 2)
-                
-                st.write(f"🔄 Trasferimento 1/2: funding → exchange ({funding_transfer} USDT)")
+                # Primo trasferimento: funding -> exchange
+                funding_transfer = transfer_amount + 1  # Aggiungiamo un piccolo buffer
+                logger.info(f"Trasferimento 1/2: funding → exchange ({funding_transfer} USDT)")
                 
                 transfer_result1 = self._bitfinex_internal_transfer(funding_transfer, 'funding', 'exchange')
                 
                 if not transfer_result1['success']:
-                    st.error(f"❌ {transfer_result1['error']}")
+                    logger.error(f"Errore primo trasferimento: {transfer_result1['error']}")
                     return {
                         "success": False,
-                        "error": transfer_result1['error'],
-                        "step": "funding_to_exchange",
+                        "error": f"Errore nel primo trasferimento (funding -> exchange): {transfer_result1['error']}",
                         "transfer_needed": True,
                         "transfer_completed": False,
-                        "manual_action_required": True
+                        "manual_action_required": True,
+                        "step": "funding_to_exchange"
                     }
                 
-                st.success(f"✅ Primo trasferimento completato")
+                logger.info(f"Primo trasferimento completato con successo")
                 
-                st.info("⏱️ Attesa settlement (10 sec)")
+                # Attendi un breve periodo per il settlement
+                logger.info("Attesa settlement (10 sec)")
                 time.sleep(10)
                 
-                exchange_balance += funding_transfer
-                funding_balance -= funding_transfer
-                
-                st.write(f"🔄 Trasferimento 2/2: exchange → margin ({transfer_amount} USDT)")
+                # Secondo trasferimento: exchange -> margin
+                logger.info(f"Trasferimento 2/2: exchange → margin ({transfer_amount} USDT)")
                 
                 transfer_result2 = self._bitfinex_internal_transfer(transfer_amount, 'exchange', 'margin')
                 
                 if transfer_result2['success']:
-                    st.success(f"✅ Secondo trasferimento completato")
+                    logger.info(f"Secondo trasferimento completato con successo")
                     
-                    time.sleep(3)
-                    new_balance = api.exchange.fetch_balance()
-                    
-                    new_margin = 0
-                    if 'margin' in new_balance:
-                        new_margin = new_balance['margin'].get('USTF0', {}).get('free', 0)
-                        if new_margin == 0:
-                            new_margin = new_balance['margin'].get('USDT', {}).get('free', 0)
-                    
-                    if new_margin == 0:
-                        new_margin = margin_balance + transfer_amount
-                    
+                    # Aggiorna i saldi dopo i trasferimenti
                     return {
                         "success": True,
-                        "margin_balance": new_margin,
-                        "exchange_balance": exchange_balance - transfer_amount,
-                        "funding_balance": funding_balance,
+                        "margin_balance": margin_balance + transfer_amount,
+                        "exchange_balance": exchange_balance + funding_transfer - transfer_amount,
+                        "funding_balance": funding_balance - funding_transfer,
                         "total_balance": total_balance,
                         "required": required_usdt,
                         "transfer_needed": True,
                         "transfer_amount": transfer_amount,
                         "transfer_completed": True,
-                        "sufficient": True
+                        "sufficient": True,
+                        "transfer_type": "funding_to_exchange_to_margin"
                     }
                 else:
-                    st.error(f"❌ {transfer_result2['error']}")
+                    logger.error(f"Errore secondo trasferimento: {transfer_result2['error']}")
                     return {
                         "success": False,
-                        "error": transfer_result2['error'],
-                        "step": "exchange_to_margin",
+                        "error": f"Errore nel secondo trasferimento (exchange -> margin): {transfer_result2['error']}",
                         "transfer_needed": True,
                         "transfer_completed": False,
-                        "manual_action_required": True
+                        "manual_action_required": True,
+                        "step": "exchange_to_margin"
                     }
+            
+            elif total_balance >= required_usdt:
+                # Combinazione di wallet
+                pass  # Implementazione futura per gestire casi più complessi
             
             else:
                 shortage = required_usdt - total_balance
-                st.error(f"❌ Bitfinex: Saldo totale insufficiente (mancano {shortage} USDT)")
+                logger.error(f"Bitfinex: Saldo totale insufficiente (mancano {shortage} USDT)")
                 return {
                     "success": False,
                     "margin_balance": margin_balance,
@@ -774,13 +735,13 @@ class EntryManager:
                     "funding_balance": funding_balance,
                     "total_balance": total_balance,
                     "required": required_usdt,
-                    "sufficient": False,
                     "shortage": shortage,
-                    "error": f"Saldo insufficiente: {total_balance} USDT totali, {required_usdt} USDT richiesti"
-               }
-               
+                    "sufficient": False,
+                    "error": f"Saldo totale insufficiente: {total_balance} USDT disponibili, {required_usdt} USDT richiesti (mancano {shortage} USDT)"
+                }
+                
         except Exception as e:
-            st.error(f"❌ Errore nel controllo saldo Bitfinex: {str(e)}")
+            logger.error(f"Errore nel controllo saldo Bitfinex: {str(e)}")
             return {
                 "success": False,
                 "error": f"Errore nel controllo saldo Bitfinex: {str(e)}"
@@ -788,66 +749,65 @@ class EntryManager:
     
     def check_capital_requirements(self, exchange_long, exchange_short, required_usdt_per_position):
         """
-        Controlla che ci sia capitale sufficiente su entrambi gli exchange
+        Verifica che ci sia capitale sufficiente su entrambi gli exchange.
         
         Args:
-            exchange_long: Nome dell'exchange per posizione LONG
-            exchange_short: Nome dell'exchange per posizione SHORT
-            required_usdt_per_position: USDT richiesti per exchange
-        
-        Returns:
-            dict: Risultato della verifica del capitale
-        """
-        results = {
-            "long_exchange": {"name": exchange_long, "check": None},
-            "short_exchange": {"name": exchange_short, "check": None},
-            "overall_success": False
-        }
-        
-        # Verifica capitale exchange LONG
-        if exchange_long == "BitMEX":
-            results["long_exchange"]["check"] = self.check_bitmex_balance(required_usdt_per_position)
-        elif exchange_long == "ByBit":
-            results["long_exchange"]["check"] = self.check_bybit_balance(required_usdt_per_position)
-        elif exchange_long == "Bitfinex":
-            results["long_exchange"]["check"] = self.check_bitfinex_balance(required_usdt_per_position)
-        else:
-            st.warning(f"⚠️ Controllo capitale per {exchange_long} non ancora implementato")
-            results["long_exchange"]["check"] = {"success": False, "error": "Exchange non supportato"}
-        
-        # Verifica capitale exchange SHORT
-        if exchange_short == "BitMEX":
-            results["short_exchange"]["check"] = self.check_bitmex_balance(required_usdt_per_position)
-        elif exchange_short == "ByBit":
-            results["short_exchange"]["check"] = self.check_bybit_balance(required_usdt_per_position)
-        elif exchange_short == "Bitfinex":
-            results["short_exchange"]["check"] = self.check_bitfinex_balance(required_usdt_per_position)
-        else:
-            st.warning(f"⚠️ Controllo capitale per {exchange_short} non ancora implementato")
-            results["short_exchange"]["check"] = {"success": False, "error": "Exchange non supportato"}
-        
-        # Verifica se entrambi hanno saldo sufficiente
-        long_ok = results["long_exchange"]["check"].get("success", False)
-        short_ok = results["short_exchange"]["check"].get("success", False)
-        
-        results["overall_success"] = long_ok and short_ok
-        
-        # Visualizza riepilogo
-        st.write("### 📊 Riepilogo Controllo Capitale")
-        if results["overall_success"]:
-            st.success("✅ **Capitale sufficiente su entrambi gli exchange**")
-        else:
-            st.error("❌ **Capitale insufficiente o errori rilevati**")
+            exchange_long: Exchange per la posizione long
+            exchange_short: Exchange per la posizione short
+            required_usdt_per_position: USDT richiesti per ciascuna posizione
             
-            if not long_ok:
-                error_msg = results["long_exchange"]["check"].get("error", "Errore sconosciuto")
-                st.error(f"• LONG ({exchange_long}): {error_msg}")
+        Returns:
+            dict: Risultato delle verifiche
+        """
+        try:
+            logger.info(f"Verifica capitale: {required_usdt_per_position} USDT per posizione")
+            
+            # Verifica capitale per long position
+            long_check = {"success": False, "error": "Controllo non implementato"}
+            
+            if exchange_long.lower() == "bitmex":
+                long_check = self.check_bitmex_balance(required_usdt_per_position)
+            elif exchange_long.lower() == "bybit":
+                long_check = self.check_bybit_balance(required_usdt_per_position)
+            elif exchange_long.lower() == "bitfinex":
+                long_check = self.check_bitfinex_balance(required_usdt_per_position)
+            else:
+                logger.warning(f"Controllo capitale per {exchange_long} non ancora implementato")
+            
+            # Verifica capitale per short position
+            short_check = {"success": False, "error": "Controllo non implementato"}
+            
+            if exchange_short.lower() == "bitmex":
+                short_check = self.check_bitmex_balance(required_usdt_per_position)
+            elif exchange_short.lower() == "bybit":
+                short_check = self.check_bybit_balance(required_usdt_per_position)
+            elif exchange_short.lower() == "bitfinex":
+                short_check = self.check_bitfinex_balance(required_usdt_per_position)
+            else:
+                logger.warning(f"Controllo capitale per {exchange_short} non ancora implementato")
+            
+            # Valuta risultati complessivi
+            logger.info("Riepilogo Controllo Capitale")
+            
+            if long_check.get("success", False) and short_check.get("success", False):
+                logger.info("Capitale sufficiente su entrambi gli exchange")
+                return {"overall_success": True, "long_check": long_check, "short_check": short_check}
+            else:
+                logger.error("Capitale insufficiente o errori rilevati")
                 
-            if not short_ok:
-                error_msg = results["short_exchange"]["check"].get("error", "Errore sconosciuto")
-                st.error(f"• SHORT ({exchange_short}): {error_msg}")
-        
-        return results
+                if not long_check.get("success", False):
+                    error_msg = long_check.get("error", "Errore sconosciuto")
+                    logger.error(f"LONG ({exchange_long}): {error_msg}")
+                
+                if not short_check.get("success", False):
+                    error_msg = short_check.get("error", "Errore sconosciuto")
+                    logger.error(f"SHORT ({exchange_short}): {error_msg}")
+                
+                return {"overall_success": False, "long_check": long_check, "short_check": short_check}
+                
+        except Exception as e:
+            logger.error(f"Errore nel controllo dei requisiti di capitale: {str(e)}")
+            return {"overall_success": False, "error": str(e)}
     
     def open_initial_positions(self):
         """
