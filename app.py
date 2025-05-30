@@ -1,19 +1,19 @@
 """
-Funding Arbitrage Application - App principale
-Data: 15/05/2025
+Funding Arbitrage Application - App principale per avvio del bot semi-automatico
+Data: 30/07/2024
 """
 
 import streamlit as st
 import os
 import time
 from dotenv import load_dotenv
-from core.entry_manager import EntryManager
-from position_management import position_management_app
+import uuid
+from bot_main import TradingSystem
 
 # Configurazione pagina Streamlit
 st.set_page_config(
-    page_title="Funding Arbitrage",
-    page_icon="💰",
+    page_title="Funding Arbitrage Bot",
+    page_icon="🤖",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -22,7 +22,8 @@ st.set_page_config(
 load_dotenv()
 
 def main():
-    st.title("Funding Arbitrage Strategy")
+    st.title("🚀 Avvia Bot Semi-Automatico")
+    st.subheader("Configura e avvia il tuo bot di Funding Arbitrage")
     
     # Inizializzazione variabili di sessione
     if 'arb_exchange_long' not in st.session_state:
@@ -31,17 +32,22 @@ def main():
         st.session_state.arb_exchange_short = "ByBit"
     if 'arb_size' not in st.session_state:
         st.session_state.arb_size = 100.0
+    if 'bot_running' not in st.session_state:
+        st.session_state.bot_running = False
+    if 'trading_system' not in st.session_state:
+        st.session_state.trading_system = None
     
-    if 'exchange_long_select' not in st.session_state:
-        st.session_state.exchange_long_select = st.session_state.arb_exchange_long
-    if 'exchange_short_select' not in st.session_state:
-        st.session_state.exchange_short_select = st.session_state.arb_exchange_short
-    
-    def on_long_exchange_change():
-        st.session_state.arb_exchange_long = st.session_state.exchange_long_select
-    
-    def on_short_exchange_change():
-        st.session_state.arb_exchange_short = st.session_state.exchange_short_select
+    # Impedisce di mostrare il form se il bot è già in esecuzione
+    if st.session_state.bot_running:
+        st.success("✅ Bot già avviato e operativo!")
+        
+        if st.button("📊 Vai alla Dashboard", type="primary", use_container_width=True):
+            st.switch_page("interface.py")
+            
+        if st.button("⏹️ Ferma Bot", type="secondary", use_container_width=True):
+            stop_bot()
+            
+        return
     
     # Layout delle colonne per selezione exchange
     col_exchanges = st.columns(2)
@@ -51,9 +57,8 @@ def main():
         exchange_long = st.selectbox(
             "Exchange per posizione LONG",
             ["BitMEX", "Bitfinex", "ByBit"],
-            help="Seleziona l'exchange per l'apertura della posizione LONG",
             key="exchange_long_select",
-            on_change=on_long_exchange_change
+            help="Seleziona l'exchange per l'apertura della posizione LONG"
         )
     
     with col_exchanges[1]:
@@ -61,9 +66,8 @@ def main():
         exchange_short = st.selectbox(
             "Exchange per posizione SHORT",
             ["BitMEX", "Bitfinex", "ByBit"],
-            help="Seleziona l'exchange per l'apertura della posizione SHORT",
             key="exchange_short_select",
-            on_change=on_short_exchange_change
+            help="Seleziona l'exchange per l'apertura della posizione SHORT"
         )
     
     if exchange_long == exchange_short:
@@ -82,104 +86,104 @@ def main():
     )
     st.session_state.arb_size = usdt_amount
     
-    # Carica l'EntryManager
-    entry_manager = EntryManager(
-        user_id="default_user",  # In futuro potrebbe essere un ID utente reale
-        config={
-            "parameters": {
-                "symbol": "SOLUSDT",  # Simbolo predefinito, verrà rilevato automaticamente
-                "amount": usdt_amount  # Importo totale in USDT
-            },
-            "exchanges": [exchange_long, exchange_short]
-        },
-        db=None,  # Attualmente non utilizziamo un database
-        exchange=None  # Verrà inizializzato all'interno di EntryManager
-    )
-    
-    # Mostra calcoli size
-    sol_size_info = entry_manager.calculate_sol_size(usdt_amount)
-    
-    if not sol_size_info["success"]:
-        st.error(sol_size_info["error"])
-        st.stop()
-    
-    sol_size = sol_size_info["sol_size"]
-    calc_details = sol_size_info["details"]
-    
-    with st.expander("🧮 Dettagli Calcolo", expanded=True):
-        st.write(f"**USDT Totale:** {calc_details['usdt_total']} USDT")
-        st.write(f"**USDT per posizione:** {calc_details['usdt_per_position']} USDT")
-        st.write(f"**USDT con leva 5x:** {calc_details['usdt_leveraged']} USDT")
-        st.write(f"**Prezzo SOL:** {calc_details['sol_price']} USDT")
-        st.write(f"**SOL calcolato:** {calc_details['sol_quantity_raw']:.4f}")
-        st.write(f"**SOL finale (arrotondato):** {calc_details['sol_size_final']} SOL")
-    
-    # Pulsante per eseguire gli ordini
-    if st.button("Esegui Ordini", type="primary", use_container_width=True):
-        # Controllo delle API keys
-        api_keys_missing = False
+    # Parametri avanzati
+    with st.expander("🔧 Parametri Avanzati", expanded=False):
+        risk_level = st.slider(
+            "Livello di Rischio Massimo (%)", 
+            min_value=50, 
+            max_value=95, 
+            value=80,
+            help="Livello di rischio (in percentuale) che attiva la chiusura automatica delle posizioni"
+        )
         
-        st.write("### 🔐 Verifica API Keys")
-        if not (os.getenv(f"{exchange_long.upper()}_API_KEY") and os.getenv(f"{exchange_long.upper()}_API_SECRET")):
-            st.error(f"❌ API Key e Secret per {exchange_long} non configurati")
-            api_keys_missing = True
-        else:
-            st.success(f"✅ API Key per {exchange_long} configurate")
-        
-        if not (os.getenv(f"{exchange_short.upper()}_API_KEY") and os.getenv(f"{exchange_short.upper()}_API_SECRET")):
-            st.error(f"❌ API Key e Secret per {exchange_short} non configurati")
-            api_keys_missing = True
-        else:
-            st.success(f"✅ API Key per {exchange_short} configurate")
-        
-        if exchange_long == exchange_short:
-            st.error("❌ Non puoi usare lo stesso exchange per entrambe le posizioni")
-            api_keys_missing = True
-        else:
-            st.success("✅ Exchange diversi selezionati")
-        
-        if sol_size <= 0:
-            st.error("❌ La quantità di SOL calcolata non è valida")
-            api_keys_missing = True
-        else:
-            st.success(f"✅ Quantità SOL valida: {sol_size}")
-        
-        if not api_keys_missing:
-            # Controlla disponibilità capitale
-            with st.spinner("Verifico capitale disponibile..."):
-                capital_check = entry_manager.check_capital_requirements(
-                    exchange_long,
-                    exchange_short,
-                    calc_details['usdt_per_position']
-                )
+        balance_threshold = st.slider(
+            "Soglia Bilanciamento Margine (%)", 
+            min_value=5, 
+            max_value=50, 
+            value=20,
+            help="Differenza percentuale di margine che attiva il bilanciamento automatico"
+        )
+    
+    # Pulsante per avviare il bot
+    if st.button("🚀 START BOT", type="primary", use_container_width=True):
+        with st.spinner("Avvio del bot in corso..."):
+            # Controllo delle API keys
+            api_keys_missing = False
+            
+            if not (os.getenv(f"{exchange_long.upper()}_API_KEY") and os.getenv(f"{exchange_long.upper()}_API_SECRET")):
+                st.error(f"❌ API Key e Secret per {exchange_long} non configurati")
+                api_keys_missing = True
+            
+            if not (os.getenv(f"{exchange_short.upper()}_API_KEY") and os.getenv(f"{exchange_short.upper()}_API_SECRET")):
+                st.error(f"❌ API Key e Secret per {exchange_short} non configurati")
+                api_keys_missing = True
+            
+            if exchange_long == exchange_short:
+                st.error("❌ Non puoi usare lo stesso exchange per entrambe le posizioni")
+                api_keys_missing = True
+            
+            if not api_keys_missing:
+                # Crea configurazione utente
+                user_id = f"user_{uuid.uuid4().hex[:8]}"
                 
-                if capital_check["overall_success"]:
-                    # Esegui gli ordini
-                    with st.spinner("🔄 Apertura posizioni in corso..."):
-                        result = entry_manager.open_initial_positions()
-                        
-                        if result["success"]:
-                            if result.get("already_open", False):
-                                st.warning("⚠️ Posizioni già aperte in precedenza")
-                                st.write("Dettagli posizioni:")
-                                for pos in result["positions"]:
-                                    st.write(f"- {pos['exchange']}: {pos['side'].upper()} {pos['size']} {pos['symbol']}")
-                            else:
-                                st.success("🎉 **Operazione di Arbitraggio Completata con Successo**")
-                                st.write("Dettagli posizioni:")
-                                for pos in result["positions"]:
-                                    st.write(f"- {pos['exchange']}: {pos['side'].upper()} {pos['size']} {pos['symbol']}")
-                            
-                            st.session_state['has_open_positions'] = True
-                        else:
-                            st.error(f"❌ Errore nell'apertura delle posizioni: {result['error']}")
+                config = {
+                    "user_id": user_id,
+                    "exchange_long": exchange_long,
+                    "exchange_short": exchange_short,
+                    "importo": usdt_amount,
+                    "parameters": {
+                        "symbol": "SOLUSDT",
+                        "amount": usdt_amount
+                    },
+                    "exchanges": [exchange_long, exchange_short],
+                    "risk_limits": {
+                        "max_risk_level": risk_level,
+                        "liquidation_buffer": 100 - risk_level
+                    },
+                    "margin_balance": {
+                        "threshold": balance_threshold
+                    }
+                }
+                
+                # Avvia il sistema di trading
+                trading_system = TradingSystem()
+                result = trading_system.start_bot(config)
+                
+                if result["success"]:
+                    st.session_state.bot_running = True
+                    st.session_state.trading_system = trading_system
+                    st.session_state.user_id = user_id
+                    
+                    st.success("✅ Bot avviato con successo! Ora lavora automaticamente.")
+                    st.balloons()
+                    
+                    # Mostra dettagli delle posizioni aperte
+                    if "positions" in result and result["positions"]:
+                        st.subheader("Posizioni Aperte")
+                        for pos in result["positions"]:
+                            st.write(f"- {pos['exchange']}: {pos['side'].upper()} {pos['size']} {pos['symbol']}")
+                    
+                    # Pulsante per andare alla dashboard
+                    if st.button("📊 Vai alla Dashboard", use_container_width=True):
+                        st.switch_page("interface.py")
                 else:
-                    st.error("❌ **Impossibile procedere: capitale insufficiente**")
-    
-    # Gestione posizioni esistenti
-    if 'has_open_positions' in st.session_state and st.session_state['has_open_positions']:
-        if st.button("Gestisci Posizioni", type="secondary", use_container_width=True):
-            position_management_app()
+                    st.error(f"❌ Errore nell'avvio del bot: {result.get('error', 'Errore sconosciuto')}")
+
+def stop_bot():
+    """Ferma il bot attualmente in esecuzione"""
+    if st.session_state.trading_system:
+        with st.spinner("Arresto del bot in corso..."):
+            result = st.session_state.trading_system.stop_bot()
+            
+            if result["success"]:
+                st.session_state.bot_running = False
+                st.session_state.trading_system = None
+                st.success("Bot arrestato con successo")
+                st.rerun()
+            else:
+                st.error(f"Errore nell'arresto del bot: {result.get('error', 'Errore sconosciuto')}")
+    else:
+        st.warning("Nessun bot attivo da fermare")
 
 if __name__ == "__main__":
     main() 

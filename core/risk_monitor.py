@@ -5,6 +5,7 @@ Controlla continuamente il livello di rischio delle posizioni aperte.
 
 import logging
 import time
+import threading
 from datetime import datetime, timezone
 
 # Configurazione logging
@@ -32,6 +33,11 @@ class RiskMonitor:
         self.max_risk_level = self.risk_limits.get("max_risk_level", 80)
         self.liquidation_buffer = self.risk_limits.get("liquidation_buffer", 20)
         
+        # Variabili per il monitoraggio automatico
+        self.monitoring_active = False
+        self.monitoring_thread = None
+        self.stop_event = threading.Event()
+        
         logger.info(f"RiskMonitor inizializzato per l'utente {user_id}")
     
     def check_positions(self):
@@ -45,11 +51,11 @@ class RiskMonitor:
         logger.info(f"Controllo rischio posizioni per l'utente {self.user_id}")
         
         # Recupera le posizioni aperte
-        positions_result = self.exchange.get_open_positions()
+        positions_result = self.exchange.get_open_positions() if self.exchange else {"success": False, "positions": []}
         
-        if not positions_result["success"] or not positions_result["positions"]:
+        if not positions_result.get("success", False) or not positions_result.get("positions", []):
             logger.info("Nessuna posizione aperta da monitorare")
-            return {"high_risk_detected": False, "positions": []}
+            return {"high_risk_detected": False, "positions": [], "risky_positions": []}
         
         positions = positions_result["positions"]
         risky_positions = []
@@ -59,7 +65,8 @@ class RiskMonitor:
             risk_status = self._calculate_risk_level(position)
             
             # Aggiorna la posizione nel database con il rischio corrente
-            self._update_position_risk(position["position_id"], risk_status)
+            if self.db:
+                self._update_position_risk(position.get("position_id", ""), risk_status)
             
             # Se il rischio è elevato, aggiungi alla lista delle posizioni a rischio
             if risk_status["risk_level"] >= self.max_risk_level:
@@ -69,7 +76,8 @@ class RiskMonitor:
                 })
                 
                 # Registra l'evento di rischio nel database
-                self._log_risk_event(position, risk_status)
+                if self.db:
+                    self._log_risk_event(position, risk_status)
         
         # Determina se c'è un alto rischio complessivo
         high_risk_detected = len(risky_positions) > 0
@@ -87,6 +95,77 @@ class RiskMonitor:
             logger.info("Nessun rischio elevato rilevato")
         
         return result
+    
+    def start_monitoring(self, interval=10):
+        """
+        Avvia il monitoraggio automatico delle posizioni in un thread separato
+        
+        Args:
+            interval: Intervallo in secondi tra i controlli
+        """
+        if self.monitoring_active:
+            logger.warning("Monitoraggio già attivo, nessuna azione necessaria")
+            return
+        
+        # Imposta il flag di monitoraggio attivo
+        self.monitoring_active = True
+        self.stop_event.clear()
+        
+        # Crea un nuovo thread per il monitoraggio
+        self.monitoring_thread = threading.Thread(
+            target=self._monitoring_loop,
+            args=(interval,),
+            daemon=True
+        )
+        
+        # Avvia il thread
+        self.monitoring_thread.start()
+        
+        logger.info(f"Monitoraggio rischio avviato con intervallo di {interval} secondi")
+    
+    def stop_monitoring(self):
+        """Ferma il monitoraggio automatico"""
+        if not self.monitoring_active:
+            logger.warning("Monitoraggio non attivo, nessuna azione necessaria")
+            return
+        
+        # Imposta il flag di stop
+        self.monitoring_active = False
+        self.stop_event.set()
+        
+        # Attendi che il thread termini
+        if self.monitoring_thread and self.monitoring_thread.is_alive():
+            self.monitoring_thread.join(timeout=5.0)
+        
+        logger.info("Monitoraggio rischio fermato")
+    
+    def _monitoring_loop(self, interval):
+        """
+        Loop di monitoraggio continuo che controlla le posizioni a intervalli regolari
+        
+        Args:
+            interval: Intervallo in secondi tra i controlli
+        """
+        logger.info(f"Loop di monitoraggio avviato per l'utente {self.user_id}")
+        
+        while self.monitoring_active and not self.stop_event.is_set():
+            try:
+                # Controlla le posizioni
+                self.check_positions()
+                
+                # Attendi l'intervallo specificato
+                for _ in range(interval):
+                    if not self.monitoring_active or self.stop_event.is_set():
+                        break
+                    time.sleep(1)
+                    
+            except Exception as e:
+                logger.error(f"Errore nel loop di monitoraggio: {str(e)}")
+                
+                # In caso di errore, attendi un po' più a lungo
+                time.sleep(30)
+        
+        logger.info(f"Loop di monitoraggio terminato per l'utente {self.user_id}")
     
     def _calculate_risk_level(self, position):
         """
@@ -162,6 +241,9 @@ class RiskMonitor:
             risk_status: Stato di rischio calcolato
         """
         try:
+            if not self.db or not position_id:
+                return
+                
             self.db.active_positions.update_one(
                 {"position_id": position_id},
                 {
@@ -185,6 +267,9 @@ class RiskMonitor:
             risk_status: Stato di rischio calcolato
         """
         try:
+            if not self.db:
+                return
+                
             event_data = {
                 "exchange": position.get("exchange", ""),
                 "position_id": position.get("position_id", ""),

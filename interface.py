@@ -1,374 +1,295 @@
 """
-Trading Bot Interface - Interfaccia utente per la gestione dei bot automatici
+Dashboard di controllo per Bot Semi-Automatico
+Data: 30/07/2024
 """
 
 import streamlit as st
-import time
-import os
-import subprocess
 import pandas as pd
-from datetime import datetime, timezone
+import time
+import plotly.graph_objects as go
+import plotly.express as px
+from datetime import datetime, timedelta
+import os
+from dotenv import load_dotenv
 
-# Importa le dipendenze necessarie
-from database.mongo_manager import MongoManager
-from core.bot_engine import BotManager
+# Carica le variabili d'ambiente
+load_dotenv()
 
-# Configurazione della pagina
+# Configurazione pagina Streamlit
 st.set_page_config(
-    page_title="Trading Bot Manager",
-    page_icon="🤖",
+    page_title="Dashboard Bot",
+    page_icon="📊",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# Inizializza le connessioni
-db = MongoManager()
-bot_manager = BotManager()
-
-def format_datetime(timestamp):
-    """Formatta un timestamp in una data e ora leggibile"""
-    if timestamp:
-        if isinstance(timestamp, datetime):
-            dt = timestamp
-        else:
-            dt = datetime.fromtimestamp(timestamp / 1000)  # Converti da millisecondi a secondi
-        return dt.strftime("%d/%m/%Y %H:%M:%S")
-    return "N/A"
-
-def format_duration(start_time):
-    """Calcola e formatta la durata di esecuzione"""
-    if not start_time:
-        return "N/A"
-    
-    if isinstance(start_time, str):
-        return start_time
-    
-    now = datetime.now(timezone.utc)
-    if isinstance(start_time, datetime):
-        duration = now - start_time
-    else:
-        start_dt = datetime.fromtimestamp(start_time / 1000, timezone.utc)
-        duration = now - start_dt
-    
-    days = duration.days
-    hours, remainder = divmod(duration.seconds, 3600)
-    minutes, seconds = divmod(remainder, 60)
-    
-    if days > 0:
-        return f"{days}g {hours}h {minutes}m"
-    else:
-        return f"{hours}h {minutes}m {seconds}s"
-
-def start_bot_process(user_id, config_name=None):
-    """Avvia un processo bot in background"""
-    try:
-        command = ["python", "bot_main.py", "start", user_id]
-        if config_name:
-            command.append(config_name)
+def get_bot_attivi():
+    """Recupera informazioni sui bot attivi dalla sessione"""
+    if 'trading_system' in st.session_state and st.session_state.trading_system:
+        # Recupera lo stato del bot
+        status = st.session_state.trading_system.get_status()
         
-        result = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            check=False
-        )
+        if status["success"]:
+            return [{
+                "id": "1",
+                "user_id": status.get("user_id", "utente"),
+                "running": status.get("active", False),
+                "num_positions": status.get("num_positions", 0),
+                "positions": status.get("positions", []),
+                "pnl": sum([float(p.get("unrealizedPnl", 0)) for p in status.get("positions", [])]),
+                "last_updated": status.get("last_updated", datetime.now().isoformat())
+            }]
         
-        if result.returncode == 0:
-            return {"success": True, "output": result.stdout.strip()}
-        else:
-            return {"success": False, "error": result.stderr.strip()}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
+    return []
 
-def stop_bot_process(bot_id):
-    """Ferma un processo bot specifico"""
-    try:
-        result = subprocess.run(
-            ["python", "bot_main.py", "stop", bot_id],
-            capture_output=True,
-            text=True,
-            check=False
-        )
+def ferma_bot(bot_id):
+    """Ferma un bot attivo"""
+    if 'trading_system' in st.session_state and st.session_state.trading_system:
+        result = st.session_state.trading_system.stop_bot()
         
-        if result.returncode == 0:
-            return {"success": True, "output": result.stdout.strip()}
-        else:
-            return {"success": False, "error": result.stderr.strip()}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-def check_bot_status(bot_id):
-    """Verifica lo stato di un bot"""
-    try:
-        result = bot_manager.get_bot_status(bot_id)
-        return result
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-def create_user_if_not_exists(user_id, email):
-    """Crea un nuovo utente se non esiste già"""
-    user = db.get_user(user_id)
-    if not user:
-        db.create_user({
-            "user_id": user_id,
-            "email": email,
-            "name": user_id
-        })
-        return True
+        if result["success"]:
+            st.session_state.bot_running = False
+            st.session_state.trading_system = None
+            return True
+    
     return False
 
-def create_default_config_if_not_exists(user_id):
-    """Crea una configurazione predefinita se non ne esiste nessuna"""
-    configs = db.get_bot_configs(user_id)
-    if not configs:
-        default_config = {
-            "strategy_type": "funding_arbitrage",
-            "parameters": {
-                "symbol": "SOLUSDT",
-                "amount": 1.0,
-                "min_funding_diff": 0.01,
-                "check_interval": 10,
-                "cooling_period": 5
-            },
-            "exchanges": ["bybit", "bitmex"],
-            "risk_limits": {
-                "max_risk_level": 80,
-                "liquidation_buffer": 20,
-                "max_position_size": 1000
-            },
-            "margin_balance": {
-                "threshold": 20,
-                "check_times": ["12:00", "00:00"]
-            }
-        }
-        db.save_bot_config(user_id, "default", default_config)
-        return True
-    return False
+def format_timestamp(timestamp_str):
+    """Formatta il timestamp in un formato leggibile"""
+    try:
+        dt = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
+        return dt.strftime('%d/%m/%Y %H:%M:%S')
+    except:
+        return timestamp_str
 
-def bot_dashboard():
-    """Dashboard principale per la gestione dei bot"""
-    st.title("🤖 Trading Bot Manager")
+def dashboard():
+    """Dashboard principale per monitorare i bot attivi"""
+    st.title("🤖 Dashboard Bot Automatici")
     
-    # Form per l'autenticazione/gestione utente
-    with st.expander("👤 Gestione Utente", expanded=True):
+    # Recupera i bot attivi
+    bot_attivi = get_bot_attivi()
+    
+    # Tempo di refresh
+    refresh_interval = 30  # secondi
+    
+    # Aggiorna automaticamente la pagina
+    if 'last_refresh' not in st.session_state:
+        st.session_state.last_refresh = datetime.now()
+    
+    time_since_refresh = (datetime.now() - st.session_state.last_refresh).total_seconds()
+    
+    refresh_progress = time_since_refresh / refresh_interval
+    if refresh_progress >= 1:
+        st.session_state.last_refresh = datetime.now()
+        st.rerun()
+    
+    # Mostra barra di avanzamento per il prossimo refresh
+    st.progress(min(refresh_progress, 1.0), f"Prossimo aggiornamento tra {max(0, int(refresh_interval - time_since_refresh))}s")
+    
+    if st.button("🔄 Aggiorna Ora"):
+        st.session_state.last_refresh = datetime.now()
+        st.rerun()
+    
+    if not bot_attivi:
+        st.warning("Nessun bot attivo al momento.")
+        
+        if st.button("🚀 Avvia Nuovo Bot", use_container_width=True):
+            st.switch_page("app.py")
+            
+        return
+    
+    # Layout a tab per diversi tipi di informazioni
+    tab1, tab2, tab3 = st.tabs(["📊 Panoramica", "📈 Posizioni", "⚙️ Controlli"])
+    
+    with tab1:
+        # Panoramica
+        st.subheader("Stato dei Bot")
+        
+        for bot in bot_attivi:
+            col1, col2, col3 = st.columns(3)
+            
+            with col1:
+                st.metric("Stato", "🟢 Attivo" if bot["running"] else "🔴 Fermo")
+                st.write(f"**ID Bot:** {bot['id']}")
+                st.write(f"**Utente:** {bot['user_id']}")
+                
+            with col2:
+                st.metric("Posizioni Aperte", bot["num_positions"])
+                st.metric("P&L Totale", f"{bot['pnl']:.2f} USDT")
+                
+            with col3:
+                st.write(f"**Ultimo Aggiornamento:** {format_timestamp(bot['last_updated'])}")
+                
+                if st.button(f"⏹️ Ferma Bot {bot['id']}", key=f"stop_bot_{bot['id']}"):
+                    if ferma_bot(bot['id']):
+                        st.success("Bot fermato con successo!")
+                        time.sleep(1)
+                        st.rerun()
+                    else:
+                        st.error("Errore durante l'arresto del bot")
+        
+        # Statistiche generali
+        st.subheader("📊 Statistiche Generali")
+        
         col1, col2 = st.columns(2)
         
         with col1:
-            user_id = st.text_input("ID Utente", value="user1")
-            email = st.text_input("Email", value="user@example.com")
-            
-            if st.button("Crea/Aggiorna Utente"):
-                try:
-                    create_user_if_not_exists(user_id, email)
-                    create_default_config_if_not_exists(user_id)
-                    st.success(f"Utente {user_id} configurato con successo!")
-                except Exception as e:
-                    st.error(f"Errore: {str(e)}")
+            # Grafico a torta per distribuzione posizioni per exchange
+            if any(bot.get("positions", []) for bot in bot_attivi):
+                all_positions = []
+                for bot in bot_attivi:
+                    all_positions.extend(bot.get("positions", []))
+                
+                exchange_counts = {}
+                for pos in all_positions:
+                    exchange = pos.get("exchange", "Sconosciuto")
+                    if exchange in exchange_counts:
+                        exchange_counts[exchange] += 1
+                    else:
+                        exchange_counts[exchange] = 1
+                
+                if exchange_counts:
+                    fig = px.pie(
+                        names=list(exchange_counts.keys()),
+                        values=list(exchange_counts.values()),
+                        title="Distribuzione Posizioni per Exchange"
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("Nessuna posizione attiva per mostrare statistiche")
         
         with col2:
-            # Recupera e mostra le configurazioni dell'utente
-            try:
-                configs = db.get_bot_configs(user_id)
-                if configs:
-                    config_names = [c["config_name"] for c in configs]
-                    selected_config = st.selectbox("Configurazione", config_names)
-                    
-                    # Mostra dettagli della configurazione selezionata
-                    selected_config_data = next((c for c in configs if c["config_name"] == selected_config), None)
-                    if selected_config_data:
-                        st.code(str(selected_config_data["parameters"]))
-                else:
-                    st.warning("Nessuna configurazione trovata per questo utente")
-            except Exception as e:
-                st.error(f"Errore nel recupero delle configurazioni: {str(e)}")
-    
-    # Sezione per avviare un nuovo bot
-    st.divider()
-    st.subheader("▶️ Avvia Nuovo Bot")
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        # Form per avviare un nuovo bot
-        start_user_id = st.text_input("ID Utente", value=user_id, key="start_user")
-        
-        try:
-            user_configs = db.get_bot_configs(start_user_id)
-            if user_configs:
-                config_options = [c["config_name"] for c in user_configs]
-                start_config = st.selectbox("Configurazione", config_options)
+            # Grafico a barre per P&L per posizione
+            if any(bot.get("positions", []) for bot in bot_attivi):
+                all_positions = []
+                for bot in bot_attivi:
+                    all_positions.extend(bot.get("positions", []))
+                
+                position_pnls = []
+                for pos in all_positions:
+                    position_pnls.append({
+                        "Simbolo": pos.get("symbol", "Sconosciuto"),
+                        "Exchange": pos.get("exchange", "Sconosciuto"),
+                        "P&L": float(pos.get("unrealizedPnl", 0))
+                    })
+                
+                if position_pnls:
+                    pnl_df = pd.DataFrame(position_pnls)
+                    fig = px.bar(
+                        pnl_df,
+                        x="Simbolo",
+                        y="P&L",
+                        color="Exchange",
+                        title="P&L per Posizione"
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
             else:
-                start_config = None
-                st.warning("Nessuna configurazione trovata per questo utente")
-        except Exception as e:
-            start_config = None
-            st.error(f"Errore nel recupero delle configurazioni: {str(e)}")
+                st.info("Nessuna posizione attiva per mostrare P&L")
+    
+    with tab2:
+        # Dettagli posizioni
+        st.subheader("Posizioni Aperte")
         
-        # Bottone per avviare il bot
-        if st.button("▶️ Avvia Bot"):
-            with st.spinner("Avvio del bot in corso..."):
-                result = bot_manager.start_bot(start_user_id, start_config)
-                
-                if result["success"]:
-                    st.success(f"Bot avviato con successo! ID: {result['bot_id']}")
-                else:
-                    st.error(f"Errore nell'avvio del bot: {result.get('error', 'Errore sconosciuto')}")
-    
-    with col2:
-        # Mostra un riepilogo dei bot attivi
-        st.subheader("🔄 Bot Attivi")
-        try:
-            active_bots = []
-            for user in db.users.find({}):
-                user_bots = db.get_active_bots(user["user_id"])
-                active_bots.extend(user_bots)
-            
-            if active_bots:
-                st.info(f"🤖 {len(active_bots)} bot attivi")
-            else:
-                st.info("🔍 Nessun bot attivo")
-        except Exception as e:
-            st.error(f"Errore nel recupero dei bot attivi: {str(e)}")
-    
-    # Sezione per monitorare e gestire i bot attivi
-    st.divider()
-    st.subheader("📊 Monitoraggio Bot")
-    
-    try:
-        # Recupera tutti i bot (attivi e inattivi)
-        all_bots = []
-        for user in db.users.find({}):
-            # Recupera i bot attivi
-            user_bots = list(db.bot_status.find({"user_id": user["user_id"]}))
-            all_bots.extend(user_bots)
-        
-        if all_bots:
-            # Prepara i dati per la tabella
-            bot_data = []
-            for bot in all_bots:
-                # Recupera il numero di posizioni aperte
-                positions_count = bot.get("positions_count", 0)
-                
-                # Calcola la durata di esecuzione
-                if bot.get("status") == "running":
-                    duration = format_duration(bot.get("started_at"))
-                    status_icon = "✅"
-                else:
-                    if bot.get("stopped_at"):
-                        duration = format_duration(bot.get("started_at")) + " (fermato)"
-                    else:
-                        duration = "N/A"
-                    status_icon = "❌"
-                
-                # Aggiungi alla lista dei bot
-                bot_data.append({
-                    "ID": bot.get("bot_id", ""),
-                    "Utente": bot.get("user_id", ""),
-                    "Stato": f"{status_icon} {bot.get('status', '').upper()}",
-                    "Configurazione": bot.get("config_name", ""),
-                    "Posizioni": positions_count,
-                    "PnL": f"{bot.get('total_pnl', 0):.2f} USDT",
-                    "Attivo da": duration,
-                    "Ultima attività": format_datetime(bot.get("last_activity"))
+        all_positions = []
+        for bot in bot_attivi:
+            positions = bot.get("positions", [])
+            for pos in positions:
+                all_positions.append({
+                    "Exchange": pos.get("exchange", ""),
+                    "Simbolo": pos.get("symbol", ""),
+                    "Lato": pos.get("side", "").upper(),
+                    "Dimensione": pos.get("size", 0),
+                    "Prezzo Entrata": pos.get("entryPrice", 0),
+                    "Prezzo Attuale": pos.get("markPrice", 0),
+                    "Prezzo Liquidazione": pos.get("liquidationPrice", 0),
+                    "P&L": float(pos.get("unrealizedPnl", 0)),
+                    "Leva": pos.get("leverage", 1),
+                    "Margine": pos.get("positionMargin", 0) or pos.get("collateral", 0) or pos.get("margin", 0)
                 })
-            
-            # Crea il dataframe e visualizzalo
-            df = pd.DataFrame(bot_data)
-            st.dataframe(df, use_container_width=True)
-            
-            # Sezione per fermare un bot specifico
-            st.divider()
-            st.subheader("⏹️ Ferma Bot")
-            
-            # Lista dei bot attivi
-            active_bot_ids = [bot["bot_id"] for bot in all_bots if bot["status"] == "running"]
-            
-            if active_bot_ids:
-                selected_bot_id = st.selectbox("Seleziona Bot da Fermare", active_bot_ids)
-                
-                if st.button("⏹️ Ferma Bot"):
-                    with st.spinner("Arresto del bot in corso..."):
-                        result = bot_manager.stop_bot(selected_bot_id)
-                        
-                        if result["success"]:
-                            st.success(f"Bot {selected_bot_id} fermato con successo!")
-                        else:
-                            st.error(f"Errore nell'arresto del bot: {result.get('error', 'Errore sconosciuto')}")
-            else:
-                st.info("Nessun bot attivo da fermare")
-        else:
-            st.info("Nessun bot trovato nel database")
-    except Exception as e:
-        st.error(f"Errore nel recupero dei bot: {str(e)}")
-    
-    # Sezione per le statistiche
-    st.divider()
-    st.subheader("📈 Statistiche")
-    
-    try:
-        # Recupera statistiche aggregate
-        stats = {}
-        for user in db.users.find({}):
-            user_id = user["user_id"]
-            user_stats = db.get_stats(user_id)
-            
-            # Aggiorna le statistiche totali
-            for key, value in user_stats.items():
-                if key in stats:
-                    if isinstance(value, (int, float)):
-                        stats[key] += value
-                    elif isinstance(value, list):
-                        stats[key].extend(value)
-                else:
-                    stats[key] = value
         
-        # Visualizza le statistiche
-        col1, col2, col3, col4 = st.columns(4)
+        if all_positions:
+            positions_df = pd.DataFrame(all_positions)
+            st.dataframe(positions_df, use_container_width=True)
+            
+            # Visualizzazione del rischio
+            st.subheader("📉 Analisi Rischio")
+            
+            risk_data = []
+            for pos in all_positions:
+                current_price = float(pos["Prezzo Attuale"])
+                liquidation_price = float(pos["Prezzo Liquidazione"])
+                
+                if current_price > 0 and liquidation_price > 0:
+                    if pos["Lato"] == "LONG":
+                        distance_pct = ((current_price - liquidation_price) / current_price) * 100
+                    else:  # SHORT
+                        distance_pct = ((liquidation_price - current_price) / current_price) * 100
+                    
+                    risk_level = max(0, 100 - distance_pct)
+                    
+                    risk_data.append({
+                        "Posizione": f"{pos['Exchange']} {pos['Simbolo']} {pos['Lato']}",
+                        "Rischio (%)": risk_level,
+                        "Distanza Liquidazione (%)": distance_pct
+                    })
+            
+            if risk_data:
+                risk_df = pd.DataFrame(risk_data)
+                
+                # Grafico a barre orizzontale per livello di rischio
+                fig = px.bar(
+                    risk_df,
+                    y="Posizione",
+                    x="Rischio (%)",
+                    color="Rischio (%)",
+                    color_continuous_scale="RdYlGn_r",
+                    title="Livello di Rischio per Posizione",
+                    orientation="h"
+                )
+                
+                # Aggiungi linee di soglia
+                fig.add_vline(x=80, line_width=2, line_dash="dash", line_color="red")
+                fig.add_vline(x=50, line_width=2, line_dash="dash", line_color="orange")
+                
+                st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("Nessuna posizione aperta al momento")
+    
+    with tab3:
+        # Controlli manuali
+        st.subheader("⚙️ Controlli Manuali")
+        
+        col1, col2 = st.columns(2)
         
         with col1:
-            st.metric("Utenti", stats.get("users_count", 0))
+            st.write("**Gestione Bot**")
+            
+            if st.button("⏹️ Ferma Bot", use_container_width=True):
+                if ferma_bot("1"):  # Assumiamo che ci sia solo un bot con ID "1"
+                    st.success("Bot fermato con successo!")
+                    time.sleep(1)
+                    st.rerun()
+                else:
+                    st.error("Errore durante l'arresto del bot")
+            
+            if st.button("🚀 Avvia Nuovo Bot", use_container_width=True):
+                st.switch_page("app.py")
         
         with col2:
-            st.metric("Bot Attivi", stats.get("active_bots_count", 0))
-        
-        with col3:
-            st.metric("Posizioni Aperte", stats.get("active_positions_count", 0))
-        
-        with col4:
-            st.metric("Eventi di Rischio (24h)", stats.get("risk_events_24h", 0))
-        
-    except Exception as e:
-        st.error(f"Errore nel recupero delle statistiche: {str(e)}")
+            st.write("**Azioni Disponibili**")
+            
+            if st.button("🔄 Bilancia Margine Manualmente", use_container_width=True):
+                if 'trading_system' in st.session_state and st.session_state.trading_system:
+                    with st.spinner("Bilanciamento margine in corso..."):
+                        # Esegui il bilanciamento manualmente
+                        result = st.session_state.trading_system._esegui_bilanciamento()
+                        st.success("Bilanciamento completato!")
+                else:
+                    st.error("Nessun bot attivo per eseguire il bilanciamento")
 
-
-# Funzione principale
 def main():
-    # Sidebar
-    with st.sidebar:
-        st.title("📊 Navigazione")
-        
-        # Selettore di pagina
-        pagina = st.radio(
-            "Seleziona Vista:",
-            ["🤖 Dashboard Bot", "📊 Analisi Posizioni", "⚙️ Configurazioni"]
-        )
-        
-        # Informazioni aggiuntive
-        st.divider()
-        st.caption("Versione: 2.0 (Automatica)")
-        st.caption("© 2025 - Tutti i diritti riservati")
-    
-    # Pagine
-    if pagina == "🤖 Dashboard Bot":
-        bot_dashboard()
-    elif pagina == "📊 Analisi Posizioni":
-        st.title("📊 Analisi Posizioni")
-        st.info("Funzionalità in sviluppo...")
-    else:
-        st.title("⚙️ Configurazioni")
-        st.info("Funzionalità in sviluppo...")
+    """Funzione principale per la dashboard"""
+    dashboard()
 
-
-# Avvio dell'applicazione
 if __name__ == "__main__":
     main() 
