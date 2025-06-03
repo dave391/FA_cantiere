@@ -15,14 +15,6 @@ from dotenv import load_dotenv
 # Carica le variabili d'ambiente
 load_dotenv()
 
-# Configurazione pagina Streamlit
-st.set_page_config(
-    page_title="Dashboard Bot",
-    page_icon="📊",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
-
 def get_bot_attivi():
     """Recupera informazioni sui bot attivi dalla sessione"""
     bot_attivi = []
@@ -83,20 +75,21 @@ def dashboard():
     refresh_progress = time_since_refresh / refresh_interval
     if refresh_progress >= 1:
         st.session_state.last_refresh = datetime.now()
-        st.rerun()
+        st.experimental_rerun()
     
     # Mostra barra di avanzamento per il prossimo refresh
     st.progress(min(refresh_progress, 1.0), f"Prossimo aggiornamento tra {max(0, int(refresh_interval - time_since_refresh))}s")
     
     if st.button("🔄 Aggiorna Ora"):
         st.session_state.last_refresh = datetime.now()
-        st.rerun()
+        st.experimental_rerun()
     
     if not bot_attivi:
         st.warning("Nessun bot attivo al momento.")
         
         if st.button("🚀 Avvia Nuovo Bot", use_container_width=True):
-            st.switch_page("app.py")
+            st.session_state.current_page = "app"
+            st.experimental_rerun()
             
         return
     
@@ -126,7 +119,7 @@ def dashboard():
                     if ferma_bot(bot['id']):
                         st.success("Bot fermato con successo!")
                         time.sleep(1)
-                        st.rerun()
+                        st.experimental_rerun()
                     else:
                         st.error("Errore durante l'arresto del bot")
         
@@ -270,12 +263,13 @@ def dashboard():
                 if ferma_bot("1"):  # Assumiamo che ci sia solo un bot con ID "1"
                     st.success("Bot fermato con successo!")
                     time.sleep(1)
-                    st.rerun()
+                    st.experimental_rerun()
                 else:
                     st.error("Errore durante l'arresto del bot")
             
             if st.button("🚀 Avvia Nuovo Bot", use_container_width=True):
-                st.switch_page("app.py")
+                st.session_state.current_page = "app"
+                st.experimental_rerun()
         
         with col2:
             st.write("**Azioni Disponibili**")

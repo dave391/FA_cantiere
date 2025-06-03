@@ -10,6 +10,7 @@ import schedule
 from datetime import datetime, timezone
 import os
 import sys
+import uuid
 from dotenv import load_dotenv
 
 from core.entry_manager import EntryManager
@@ -18,6 +19,8 @@ from core.emergency_closer import EmergencyCloser
 from core.cycle_manager import CycleManager
 from core.margin_balancer import MarginBalancer
 from core.bot_engine import BotEngine
+from database.mongo_manager import MongoManager
+from api.exchange_manager import ExchangeManager
 
 # Configurazione logging
 logging.basicConfig(
@@ -39,13 +42,20 @@ class TradingSystem:
         self.user_id = None
         self.threads = []
         self.stop_event = threading.Event()
+        self.bot_id = None
         
         # Carica le variabili d'ambiente
         load_dotenv()
         
         # Inizializza database e exchange manager
-        self.db = None  # In futuro qui ci sarà la connessione al database
-        self.exchange = None  # In futuro qui ci sarà l'exchange manager
+        try:
+            self.db = MongoManager()
+            logger.info("Database inizializzato")
+        except Exception as e:
+            logger.error(f"Errore inizializzazione database: {e}")
+            self.db = None
+        
+        self.exchange = None  # Sarà inizializzato in base all'utente
         
         logger.info("Sistema di Trading inizializzato")
     
@@ -64,7 +74,10 @@ class TradingSystem:
             self.config = config_utente
             self.user_id = config_utente.get("user_id", "default_user")
             
-            logger.info(f"Avvio bot per utente {self.user_id}")
+            # Genera un ID univoco per il bot
+            self.bot_id = f"bot_{uuid.uuid4().hex[:8]}"
+            
+            logger.info(f"Avvio bot {self.bot_id} per utente {self.user_id}")
             logger.info(f"Configurazione: {self.config}")
             
             # Imposta il bot come attivo
@@ -73,7 +86,11 @@ class TradingSystem:
             # 2. Inizializza i componenti del sistema
             self._inizializza_componenti()
             
-            # 3. Apri posizioni iniziali (UNA VOLTA)
+            # 3. Registra l'avvio del bot nel database
+            if self.db:
+                self.db.start_bot(self.user_id, self.bot_id, config_utente.get("config_name", "funding_arbitrage"))
+            
+            # 4. Apri posizioni iniziali (UNA VOLTA)
             result = self.apri_posizioni_iniziali()
             
             if not result["success"]:
@@ -83,10 +100,10 @@ class TradingSystem:
                     "error": f"Errore nell'apertura delle posizioni iniziali: {result.get('error', 'Errore sconosciuto')}"
                 }
             
-            # 4. Avvia monitoraggio continuo
+            # 5. Avvia monitoraggio continuo
             self.avvia_monitoraggio()
             
-            # 5. Avvia scheduler bilanciamento
+            # 6. Avvia scheduler bilanciamento
             self.avvia_scheduler()
             
             logger.info(f"Bot avviato con successo per utente {self.user_id}")
@@ -95,6 +112,7 @@ class TradingSystem:
                 "success": True,
                 "message": "Bot avviato con successo",
                 "user_id": self.user_id,
+                "bot_id": self.bot_id,
                 "positions": self.posizioni_aperte
             }
             
@@ -110,20 +128,19 @@ class TradingSystem:
     def _inizializza_componenti(self):
         """Inizializza i componenti del sistema di trading"""
         try:
-            # Inizializza database e exchange REALI
+            # Inizializza exchange per l'utente specifico
             try:
-                from database.mongo_manager import MongoManager
-                from api.exchange_manager import ExchangeManager
-                
-                self.db = MongoManager()
-                self.exchange = ExchangeManager(self.user_id)
-                logger.info("Database e exchange inizializzati")
+                if self.db:
+                    self.exchange = ExchangeManager(self.user_id, self.db)
+                    logger.info(f"Exchange manager inizializzato per utente {self.user_id}")
+                else:
+                    # Fallback per modalità senza database
+                    self.exchange = ExchangeManager(self.user_id)
+                    logger.info("Exchange manager inizializzato in modalità legacy")
             except Exception as e:
-                logger.error(f"Errore inizializzazione database/exchange: {e}")
-                # Fallback senza database per testing
-                self.db = None
+                logger.error(f"Errore inizializzazione exchange: {e}")
                 self.exchange = None
-                logger.warning("Usando modalità senza database/exchange (simulazione)")
+                logger.warning("Usando modalità senza exchange (simulazione)")
             
             # Inizializza i componenti core
             self.entry_manager = EntryManager(
@@ -188,6 +205,21 @@ class TradingSystem:
                 # Salva informazioni sulle posizioni per uso futuro
                 for pos in self.posizioni_aperte:
                     logger.info(f"Posizione aperta: {pos['exchange']} {pos['side']} {pos['size']} {pos['symbol']}")
+                    
+                    # Salva nel database se disponibile
+                    if self.db:
+                        position_data = {
+                            "position_id": pos.get("position_id", f"pos_{uuid.uuid4().hex[:8]}"),
+                            "user_id": self.user_id,
+                            "bot_id": self.bot_id,
+                            "exchange": pos["exchange"],
+                            "symbol": pos["symbol"],
+                            "side": pos["side"],
+                            "size": pos["size"],
+                            "entry_price": pos.get("entry_price", 0),
+                            "unrealized_pnl": pos.get("unrealized_pnl", 0)
+                        }
+                        self.db.save_position(position_data)
                 
                 return {
                     "success": True,
@@ -201,153 +233,197 @@ class TradingSystem:
             logger.error(f"Errore nell'apertura delle posizioni iniziali: {str(e)}")
             return {
                 "success": False,
-                "error": f"Errore nell'apertura delle posizioni iniziali: {str(e)}"
+                "error": f"Errore nell'apertura delle posizioni: {str(e)}"
             }
     
     def avvia_monitoraggio(self):
-        """Avvia il thread di monitoraggio delle posizioni"""
+        """Avvia il thread di monitoraggio continuo"""
         try:
-            logger.info("Avvio monitoraggio continuo")
-            
-            # Crea un thread per il monitoraggio continuo
-            monitor_thread = threading.Thread(
-                target=self._monitor_loop,
-                daemon=True
-            )
-            
-            monitor_thread.start()
+            # Crea un nuovo thread per il monitoraggio continuo
+            monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
             self.threads.append(monitor_thread)
+            
+            # Avvia il thread
+            monitor_thread.start()
             
             logger.info("Thread di monitoraggio avviato")
             
         except Exception as e:
             logger.error(f"Errore nell'avvio del monitoraggio: {str(e)}")
-            raise
     
     def _monitor_loop(self):
-        """Loop di monitoraggio che controlla le posizioni ogni 10 secondi"""
-        logger.info("Loop di monitoraggio avviato")
-        
-        while self.bot_attivo and not self.stop_event.is_set():
-            try:
-                # Controlla il livello di rischio delle posizioni
-                risk_status = self.risk_monitor.check_positions()
-                
-                if risk_status["high_risk_detected"]:
-                    logger.warning(f"Rilevato alto rischio: {risk_status['details']}")
+        """Loop di monitoraggio continuo in un thread separato"""
+        try:
+            logger.info("Loop di monitoraggio avviato")
+            
+            # Imposta intervallo di monitoraggio (in secondi)
+            monitor_interval = 30
+            
+            # Loop principale
+            while self.bot_attivo and not self.stop_event.is_set():
+                try:
+                    # 1. Controlla i rischi
+                    risk_status = self.risk_monitor.check_risks()
                     
-                    # Chiudi le posizioni a rischio
-                    risky_positions = risk_status.get("risky_positions", [])
-                    
-                    if risky_positions:
-                        logger.info(f"Chiusura di {len(risky_positions)} posizioni a rischio")
+                    if risk_status.get("emergency", False):
+                        logger.warning(f"Situazione di emergenza rilevata: {risk_status.get('reason', 'Rischio sconosciuto')}")
                         
-                        for pos_data in risky_positions:
-                            position = pos_data["position"]
-                            risk_info = pos_data["risk_status"]
-                            
-                            logger.info(f"Chiusura posizione a rischio: {position['exchange']} {position['symbol']} "
-                                       f"(Rischio: {risk_info['risk_level']:.1f}%)")
-                            
-                            # Chiudi la posizione
-                            close_result = self.emergency_closer.close_position(position)
-                            
-                            if close_result["success"]:
-                                logger.info(f"Posizione chiusa con successo: {position['exchange']} {position['symbol']}")
-                            else:
-                                logger.error(f"Errore nella chiusura della posizione: {close_result.get('error', 'Errore sconosciuto')}")
+                        # Chiusura di emergenza
+                        emergency_result = self.emergency_closer.close_positions()
                         
-                        # Riapri nuove posizioni
-                        logger.info("Riapertura di nuove posizioni dopo chiusura per rischio")
-                        reopen_result = self.cycle_manager.reopen_positions()
-                        
-                        if reopen_result["success"]:
-                            logger.info("Nuove posizioni riaperte con successo")
-                            self.posizioni_aperte = reopen_result.get("positions", [])
+                        if emergency_result.get("success", False):
+                            logger.info("Posizioni chiuse con successo in emergenza")
+                            
+                            if self.db:
+                                # Registra l'evento nel database
+                                self.db.log_risk_event(
+                                    self.user_id,
+                                    "emergency_close",
+                                    "critical",
+                                    {"reason": risk_status.get("reason", ""), "result": emergency_result}
+                                )
+                                
+                                # Aggiorna lo stato del bot
+                                self.db.stop_bot(self.bot_id)
+                            
+                            # Ferma il bot
+                            self.bot_attivo = False
+                            self.stop_event.set()
+                            break
                         else:
-                            logger.error(f"Errore nella riapertura delle posizioni: {reopen_result.get('error', 'Errore sconosciuto')}")
+                            logger.error(f"Errore nella chiusura di emergenza: {emergency_result.get('error', 'Errore sconosciuto')}")
+                    
+                    # 2. Aggiorna prezzi e stato
+                    if self.cycle_manager:
+                        self.cycle_manager.update_positions()
+                    
+                    # 3. Aggiorna il database con lo stato corrente
+                    if self.db and self.exchange:
+                        # Recupera le posizioni aperte
+                        positions_result = self.exchange.get_open_positions()
+                        
+                        if positions_result.get("success", False):
+                            positions = positions_result.get("positions", [])
+                            
+                            # Aggiorna numero posizioni nel database
+                            self.db.bot_status.update_one(
+                                {"bot_id": self.bot_id},
+                                {"$set": {
+                                    "positions_count": len(positions),
+                                    "last_activity": datetime.now(timezone.utc)
+                                }}
+                            )
+                            
+                            # Calcola PnL totale
+                            total_pnl = sum([float(p.get("unrealizedPnl", 0)) for p in positions])
+                            
+                            # Aggiorna PnL nel database
+                            self.db.bot_status.update_one(
+                                {"bot_id": self.bot_id},
+                                {"$set": {"total_pnl": total_pnl}}
+                            )
                 
-                # Aspetta 10 secondi prima del prossimo controllo
-                time.sleep(10)
+                except Exception as e:
+                    logger.error(f"Errore nel ciclo di monitoraggio: {str(e)}")
                 
-            except Exception as e:
-                logger.error(f"Errore nel loop di monitoraggio: {str(e)}")
-                time.sleep(30)  # In caso di errore, aspetta più a lungo
+                # Attendi il prossimo ciclo
+                time.sleep(monitor_interval)
+            
+            logger.info("Loop di monitoraggio terminato")
+            
+        except Exception as e:
+            logger.error(f"Errore critico nel thread di monitoraggio: {str(e)}")
     
     def avvia_scheduler(self):
-        """Avvia lo scheduler per il bilanciamento del margine"""
+        """Avvia lo scheduler per operazioni periodiche"""
         try:
-            logger.info("Avvio scheduler per bilanciamento margine")
+            # Pianifica operazioni periodiche
+            schedule.every(4).hours.do(self._esegui_bilanciamento)
             
-            # Programma il bilanciamento del margine alle 12:00 e 00:00
-            schedule.every().day.at("12:00").do(self._esegui_bilanciamento)
-            schedule.every().day.at("00:00").do(self._esegui_bilanciamento)
-            
-            # Crea un thread per lo scheduler
-            scheduler_thread = threading.Thread(
-                target=self._scheduler_loop,
-                daemon=True
-            )
-            
-            scheduler_thread.start()
+            # Crea un nuovo thread per lo scheduler
+            scheduler_thread = threading.Thread(target=self._scheduler_loop, daemon=True)
             self.threads.append(scheduler_thread)
+            
+            # Avvia il thread
+            scheduler_thread.start()
             
             logger.info("Scheduler avviato")
             
         except Exception as e:
             logger.error(f"Errore nell'avvio dello scheduler: {str(e)}")
-            raise
     
     def _scheduler_loop(self):
-        """Loop dello scheduler che controlla e esegue i job programmati"""
-        logger.info("Loop dello scheduler avviato")
-        
-        while self.bot_attivo and not self.stop_event.is_set():
-            try:
-                # Esegui i job programmati
+        """Loop per lo scheduler in un thread separato"""
+        try:
+            logger.info("Loop scheduler avviato")
+            
+            # Loop principale
+            while self.bot_attivo and not self.stop_event.is_set():
+                # Esegui job pianificati
                 schedule.run_pending()
                 
-                # Aspetta 1 minuto prima del prossimo controllo
+                # Attendi
                 time.sleep(60)
-                
-            except Exception as e:
-                logger.error(f"Errore nel loop dello scheduler: {str(e)}")
-                time.sleep(300)  # In caso di errore, aspetta 5 minuti
+            
+            logger.info("Loop scheduler terminato")
+            
+        except Exception as e:
+            logger.error(f"Errore critico nel thread dello scheduler: {str(e)}")
     
     def _esegui_bilanciamento(self):
-        """Esegue il bilanciamento del margine tra gli exchange"""
+        """Esegue il bilanciamento dei margini tra gli exchange"""
         try:
-            logger.info("Esecuzione bilanciamento margine programmato")
+            logger.info("Esecuzione bilanciamento margini periodico")
             
-            if self.bot_attivo:
+            if self.margin_balancer:
                 result = self.margin_balancer.balance_margins()
                 
-                if result["success"] and result.get("balanced", False):
-                    logger.info(f"Bilanciamento margine completato: {result.get('amount', 0)} USDT "
-                               f"da {result.get('source_exchange', '')} a {result.get('target_exchange', '')}")
+                if result.get("success", False):
+                    logger.info(f"Bilanciamento margini completato: {result.get('message', '')}")
+                    
+                    # Registra nel database
+                    if self.db:
+                        self.db.log_margin_balance(
+                            self.user_id, 
+                            "all", 
+                            {"action": "balance", "result": result}
+                        )
                 else:
-                    reason = result.get("reason", "Nessun motivo specificato")
-                    logger.info(f"Bilanciamento non necessario: {reason}")
-            else:
-                logger.info("Bot non attivo, bilanciamento margine saltato")
+                    logger.warning(f"Bilanciamento margini non riuscito: {result.get('error', 'Errore sconosciuto')}")
             
         except Exception as e:
             logger.error(f"Errore nell'esecuzione del bilanciamento: {str(e)}")
     
     def stop_bot(self):
-        """Ferma il bot e tutte le attività in background"""
+        """Ferma il bot attualmente in esecuzione"""
         try:
-            logger.info(f"Arresto bot per utente {self.user_id}")
+            logger.info(f"Arresto bot {self.bot_id} per utente {self.user_id}")
             
             # Imposta il flag di arresto
             self.bot_attivo = False
             self.stop_event.set()
             
-            # Attendi la terminazione dei thread
-            for thread in self.threads:
-                thread.join(timeout=5.0)
+            # Chiudi tutte le posizioni aperte
+            if self.emergency_closer:
+                result = self.emergency_closer.close_positions()
+                
+                if not result.get("success", False):
+                    logger.error(f"Errore nella chiusura delle posizioni: {result.get('error', 'Errore sconosciuto')}")
+                    return {
+                        "success": False,
+                        "error": f"Errore nella chiusura delle posizioni: {result.get('error', 'Errore sconosciuto')}"
+                    }
             
-            logger.info("Bot arrestato con successo")
+            # Attendi la terminazione di tutti i thread
+            for thread in self.threads:
+                if thread.is_alive():
+                    thread.join(timeout=10)
+            
+            # Aggiorna lo stato nel database
+            if self.db:
+                self.db.stop_bot(self.bot_id)
+            
+            logger.info(f"Bot {self.bot_id} arrestato con successo")
             
             return {
                 "success": True,
@@ -363,28 +439,39 @@ class TradingSystem:
             }
     
     def get_status(self):
-        """Restituisce lo stato attuale del bot"""
+        """Recupera lo stato attuale del bot"""
         try:
-            # Recupera informazioni aggiornate sulle posizioni
-            positions_result = self.exchange.get_open_positions() if self.exchange else {"success": False, "positions": []}
-            
-            active_positions = positions_result.get("positions", []) if positions_result.get("success", False) else []
-            
-            return {
+            # Stato di base
+            status = {
                 "success": True,
                 "active": self.bot_attivo,
                 "user_id": self.user_id,
-                "positions": active_positions,
-                "num_positions": len(active_positions),
+                "bot_id": self.bot_id,
                 "last_updated": datetime.now(timezone.utc).isoformat()
             }
             
+            # Recupera posizioni aperte
+            if self.exchange:
+                positions_result = self.exchange.get_open_positions()
+                
+                if positions_result.get("success", False):
+                    positions = positions_result.get("positions", [])
+                    status["positions"] = positions
+                    status["num_positions"] = len(positions)
+            
+            # Se non ci sono posizioni disponibili dall'exchange, usa quelle memorizzate
+            if "positions" not in status:
+                status["positions"] = self.posizioni_aperte
+                status["num_positions"] = len(self.posizioni_aperte)
+            
+            return status
+            
         except Exception as e:
-            logger.error(f"Errore nel recupero dello stato del bot: {str(e)}")
+            logger.error(f"Errore nel recupero dello stato: {str(e)}")
             
             return {
                 "success": False,
-                "error": f"Errore nel recupero dello stato del bot: {str(e)}"
+                "error": f"Errore nel recupero dello stato: {str(e)}"
             }
 
 
@@ -422,5 +509,17 @@ if __name__ == "__main__":
             # Non avviare il loop dell'applicazione
             sys.exit(0)
     
-    # Avvia l'applicazione nel loop principale
-    app.start() 
+    # Configurazione di default se nessun parametro specificato
+    default_config = {
+        "user_id": "default_user",
+        "config_name": "funding_arbitrage",
+        "strategy_type": "funding_arbitrage",
+        "exchanges": ["bybit", "bitmex"],
+        "parameters": {
+            "threshold": 0.01,
+            "size": 1000
+        }
+    }
+    
+    # Avvia il bot con configurazione di default
+    app.start_bot(default_config) 

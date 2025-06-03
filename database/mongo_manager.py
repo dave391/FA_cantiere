@@ -9,6 +9,7 @@ from typing import Dict, List, Optional, Any
 from pymongo import MongoClient, ASCENDING, DESCENDING
 from pymongo.errors import ConnectionFailure, DuplicateKeyError
 from dotenv import load_dotenv
+from security.crypto_manager import CryptoManager  # Importa il CryptoManager
 
 # Configurazione logging
 logging.basicConfig(level=logging.INFO)
@@ -30,6 +31,9 @@ class MongoManager:
             self.client.admin.command('ping')
             logger.info(f"Connessione MongoDB riuscita - Database: {self.database_name}")
             
+            # Inizializza il gestore di crittografia
+            self.crypto = CryptoManager()
+            
             # Inizializza le collections con indici
             self._setup_collections()
             
@@ -44,6 +48,13 @@ class MongoManager:
             self.users = self.db.users
             self.users.create_index("user_id", unique=True)
             self.users.create_index("email", unique=True)
+            
+            # Collection: sessions
+            self.sessions = self.db.sessions
+            self.sessions.create_index("session_id", unique=True)
+            self.sessions.create_index("token", unique=True)
+            self.sessions.create_index("user_id")
+            self.sessions.create_index("expires_at")
             
             # Collection: bot_configs
             self.bot_configs = self.db.bot_configs
@@ -89,6 +100,7 @@ class MongoManager:
                 "user_id": user_data["user_id"],
                 "email": user_data["email"],
                 "name": user_data.get("name", ""),
+                "password_hash": user_data.get("password_hash", ""),
                 "exchange_credentials": {},
                 "risk_settings": {
                     "max_daily_loss": 1000,
@@ -96,7 +108,8 @@ class MongoManager:
                     "stop_loss_percentage": 5.0
                 },
                 "created_at": datetime.now(timezone.utc),
-                "is_active": True
+                "is_active": True,
+                "is_admin": user_data.get("is_admin", False)
             }
             
             self.users.insert_one(user_doc)
@@ -114,9 +127,28 @@ class MongoManager:
         """Recupera un utente"""
         return self.users.find_one({"user_id": user_id})
     
+    def get_user_by_email(self, email: str) -> Optional[Dict]:
+        """Recupera un utente tramite email"""
+        return self.users.find_one({"email": email})
+    
     def update_user_credentials(self, user_id: str, exchange: str, credentials: Dict) -> bool:
         """Aggiorna le credenziali exchange di un utente"""
         try:
+            # Cripta le credenziali prima di salvarle
+            api_key = credentials.get("api_key")
+            api_secret = credentials.get("api_secret")
+            
+            # Se le credenziali non sono già criptate, criptale
+            if api_key and api_secret and not credentials.get("is_encrypted", False):
+                encrypted_credentials = self.crypto.encrypt_api_credentials(api_key, api_secret)
+                
+                # Preserva altri campi oltre a api_key e api_secret
+                for key, value in credentials.items():
+                    if key not in ["api_key", "api_secret"]:
+                        encrypted_credentials[key] = value
+                
+                credentials = encrypted_credentials
+            
             result = self.users.update_one(
                 {"user_id": user_id},
                 {"$set": {f"exchange_credentials.{exchange}": credentials}}
@@ -125,6 +157,96 @@ class MongoManager:
         except Exception as e:
             logger.error(f"Errore aggiornamento credenziali: {e}")
             return False
+    
+    def get_user_credentials(self, user_id: str, exchange: str) -> Optional[Dict]:
+        """Recupera le credenziali di un utente per un exchange specifico"""
+        try:
+            user = self.users.find_one(
+                {"user_id": user_id},
+                {f"exchange_credentials.{exchange}": 1}
+            )
+            
+            if not user or "exchange_credentials" not in user or exchange not in user["exchange_credentials"]:
+                return None
+                
+            credentials = user["exchange_credentials"][exchange]
+            
+            # Se le credenziali sono criptate, decriptale
+            if credentials.get("is_encrypted", False):
+                return self.crypto.decrypt_api_credentials(credentials)
+            
+            return credentials
+        except Exception as e:
+            logger.error(f"Errore recupero credenziali: {e}")
+            return None
+    
+    def get_all_users(self, include_inactive: bool = False) -> List[Dict]:
+        """Recupera tutti gli utenti"""
+        query = {} if include_inactive else {"is_active": True}
+        return list(self.users.find(query))
+    
+    def update_user(self, user_id: str, updates: Dict) -> bool:
+        """Aggiorna i dati di un utente"""
+        try:
+            result = self.users.update_one(
+                {"user_id": user_id},
+                {"$set": updates}
+            )
+            return result.modified_count > 0
+        except Exception as e:
+            logger.error(f"Errore aggiornamento utente: {e}")
+            return False
+    
+    # =================== SESSION MANAGEMENT ===================
+    
+    def create_session(self, session_data: Dict) -> bool:
+        """Crea una nuova sessione utente"""
+        try:
+            self.sessions.insert_one(session_data)
+            logger.info(f"Sessione creata per utente: {session_data['user_id']}")
+            return True
+        except Exception as e:
+            logger.error(f"Errore creazione sessione: {e}")
+            return False
+    
+    def get_session(self, token: str) -> Optional[Dict]:
+        """Recupera una sessione tramite token"""
+        return self.sessions.find_one({"token": token})
+    
+    def update_session(self, token: str, updates: Dict) -> bool:
+        """Aggiorna una sessione"""
+        try:
+            result = self.sessions.update_one(
+                {"token": token},
+                {"$set": updates}
+            )
+            return result.modified_count > 0
+        except Exception as e:
+            logger.error(f"Errore aggiornamento sessione: {e}")
+            return False
+    
+    def invalidate_session(self, token: str) -> bool:
+        """Invalida una sessione (logout)"""
+        try:
+            result = self.sessions.update_one(
+                {"token": token},
+                {"$set": {"is_active": False}}
+            )
+            return result.modified_count > 0
+        except Exception as e:
+            logger.error(f"Errore invalidazione sessione: {e}")
+            return False
+    
+    def cleanup_expired_sessions(self) -> int:
+        """Rimuove le sessioni scadute"""
+        try:
+            result = self.sessions.delete_many({
+                "expires_at": {"$lt": datetime.now(timezone.utc)}
+            })
+            return result.deleted_count
+        except Exception as e:
+            logger.error(f"Errore pulizia sessioni: {e}")
+            return 0
     
     # =================== BOT CONFIGURATION ===================
     
@@ -207,9 +329,16 @@ class MongoManager:
             logger.error(f"Errore stop bot: {e}")
             return False
     
-    def get_active_bots(self, user_id: str) -> List[Dict]:
-        """Recupera i bot attivi di un utente"""
-        return list(self.bot_status.find({"user_id": user_id, "status": "running"}))
+    def get_active_bots(self, user_id: str = None) -> List[Dict]:
+        """Recupera i bot attivi di un utente o di tutti gli utenti"""
+        if user_id:
+            return list(self.bot_status.find({"user_id": user_id, "status": "running"}))
+        else:
+            return list(self.bot_status.find({"status": "running"}))
+    
+    def get_all_bots(self) -> List[Dict]:
+        """Recupera tutti i bot nel sistema"""
+        return list(self.bot_status.find())
     
     # =================== POSITIONS ===================
     
@@ -249,22 +378,31 @@ class MongoManager:
     def update_position(self, position_id: str, updates: Dict) -> bool:
         """Aggiorna una posizione"""
         try:
+            # Assicurati che last_updated sia sempre aggiornato
             updates["last_updated"] = datetime.now(timezone.utc)
             
             result = self.active_positions.update_one(
                 {"position_id": position_id},
                 {"$set": updates}
             )
+            
             return result.modified_count > 0
         except Exception as e:
             logger.error(f"Errore aggiornamento posizione: {e}")
             return False
     
     def close_position(self, position_id: str, exit_price: float, pnl: float) -> bool:
-        """Chiude una posizione"""
+        """Chiude una posizione attiva e la sposta nella cronologia"""
         try:
-            # Aggiorna la posizione
-            self.active_positions.update_one(
+            # Recupera la posizione
+            position = self.active_positions.find_one({"position_id": position_id})
+            
+            if not position:
+                logger.warning(f"Posizione non trovata per chiusura: {position_id}")
+                return False
+            
+            # Aggiorna la posizione come chiusa
+            result = self.active_positions.update_one(
                 {"position_id": position_id},
                 {
                     "$set": {
@@ -276,144 +414,196 @@ class MongoManager:
                 }
             )
             
-            # Sposta nel trade history
-            position = self.active_positions.find_one({"position_id": position_id})
-            if position:
-                trade_doc = {
-                    "trade_id": position_id,
-                    "user_id": position["user_id"],
-                    "bot_id": position["bot_id"],
-                    "exchange": position["exchange"],
-                    "symbol": position["symbol"],
-                    "side": position["side"],
-                    "size": position["size"],
-                    "entry_price": position["entry_price"],
-                    "exit_price": exit_price,
-                    "realized_pnl": pnl,
-                    "opened_at": position["opened_at"],
-                    "closed_at": datetime.now(timezone.utc),
-                    "timestamp": datetime.now(timezone.utc)
-                }
-                
-                self.trade_history.insert_one(trade_doc)
+            # Crea voce nella cronologia di trading
+            trade_doc = {
+                "trade_id": f"trade_{position_id}",
+                "position_id": position_id,
+                "user_id": position["user_id"],
+                "bot_id": position["bot_id"],
+                "exchange": position["exchange"],
+                "symbol": position["symbol"],
+                "side": position["side"],
+                "size": position["size"],
+                "entry_price": position["entry_price"],
+                "exit_price": exit_price,
+                "pnl": pnl,
+                "opened_at": position["opened_at"],
+                "closed_at": datetime.now(timezone.utc),
+                "duration_seconds": (datetime.now(timezone.utc) - position["opened_at"]).total_seconds(),
+                "timestamp": datetime.now(timezone.utc)
+            }
             
-            return True
+            self.trade_history.insert_one(trade_doc)
             
+            return result.modified_count > 0
         except Exception as e:
             logger.error(f"Errore chiusura posizione: {e}")
             return False
     
     def get_user_positions(self, user_id: str, active_only: bool = True) -> List[Dict]:
         """Recupera le posizioni di un utente"""
-        filter_query = {"user_id": user_id}
+        query = {"user_id": user_id}
         if active_only:
-            filter_query["is_active"] = True
-            
-        return list(self.active_positions.find(filter_query))
+            query["is_active"] = True
+        
+        return list(self.active_positions.find(query))
     
-    # =================== RISK EVENTS ===================
+    def get_all_positions(self, active_only: bool = True) -> List[Dict]:
+        """Recupera tutte le posizioni nel sistema"""
+        query = {}
+        if active_only:
+            query["is_active"] = True
+        
+        return list(self.active_positions.find(query))
+    
+    # =================== RISK MONITORING ===================
     
     def log_risk_event(self, user_id: str, event_type: str, severity: str, data: Dict) -> bool:
         """Registra un evento di rischio"""
         try:
             event_doc = {
                 "user_id": user_id,
-                "event_type": event_type,  # "margin_call", "stop_loss", "max_loss_reached"
-                "severity": severity,      # "low", "medium", "high", "critical"
+                "event_type": event_type,
+                "severity": severity,
                 "data": data,
                 "timestamp": datetime.now(timezone.utc),
-                "resolved": False
+                "is_resolved": False
             }
             
             self.risk_events.insert_one(event_doc)
-            return True
             
+            return True
         except Exception as e:
-            logger.error(f"Errore log evento rischio: {e}")
+            logger.error(f"Errore nel log evento di rischio: {e}")
             return False
     
-    # =================== MARGIN BALANCE LOGS ===================
+    # =================== BALANCE MONITORING ===================
     
     def log_margin_balance(self, user_id: str, exchange: str, balance_data: Dict) -> bool:
-        """Registra il bilanciamento del margine"""
+        """Registra il saldo del margine"""
         try:
-            log_doc = {
+            balance_doc = {
                 "user_id": user_id,
                 "exchange": exchange,
-                "action": balance_data["action"],  # "add", "remove", "transfer"
-                "amount": balance_data["amount"],
-                "symbol": balance_data.get("symbol", ""),
-                "before_balance": balance_data.get("before_balance", 0.0),
-                "after_balance": balance_data.get("after_balance", 0.0),
+                "available_balance": balance_data.get("available", 0.0),
+                "used_margin": balance_data.get("used", 0.0),
+                "total_balance": balance_data.get("total", 0.0),
+                "unrealized_pnl": balance_data.get("unrealized_pnl", 0.0),
                 "timestamp": datetime.now(timezone.utc)
             }
             
-            self.margin_balance_logs.insert_one(log_doc)
-            return True
+            self.margin_balance_logs.insert_one(balance_doc)
             
+            return True
         except Exception as e:
-            logger.error(f"Errore log margine: {e}")
+            logger.error(f"Errore nel log del saldo: {e}")
             return False
     
-    # =================== UTILITY ===================
+    # =================== STATISTICS ===================
     
     def get_stats(self, user_id: str) -> Dict:
-        """Recupera statistiche utente"""
+        """Recupera statistiche per un utente specifico"""
         try:
             # Posizioni attive
-            active_positions = self.active_positions.count_documents({"user_id": user_id, "is_active": True})
+            active_positions = self.active_positions.count_documents({
+                "user_id": user_id,
+                "is_active": True
+            })
             
-            # Trade totali
-            total_trades = self.trade_history.count_documents({"user_id": user_id})
+            # PnL non realizzato
+            pnl_agg = list(self.active_positions.aggregate([
+                {"$match": {"user_id": user_id, "is_active": True}},
+                {"$group": {"_id": None, "total_pnl": {"$sum": "$unrealized_pnl"}}}
+            ]))
+            unrealized_pnl = pnl_agg[0]["total_pnl"] if pnl_agg else 0
             
-            # PnL totale
-            pipeline = [
-                {"$match": {"user_id": user_id}},
-                {"$group": {"_id": None, "total_pnl": {"$sum": "$realized_pnl"}}}
-            ]
-            pnl_result = list(self.trade_history.aggregate(pipeline))
-            total_pnl = pnl_result[0]["total_pnl"] if pnl_result else 0.0
-            
-            # Bot attivi
-            active_bots = self.bot_status.count_documents({"user_id": user_id, "status": "running"})
+            # PnL realizzato (ultimi 30 giorni)
+            thirty_days_ago = datetime.now(timezone.utc) - timedelta(days=30)
+            realized_pnl_agg = list(self.trade_history.aggregate([
+                {"$match": {"user_id": user_id, "closed_at": {"$gte": thirty_days_ago}}},
+                {"$group": {"_id": None, "total_pnl": {"$sum": "$pnl"}}}
+            ]))
+            realized_pnl = realized_pnl_agg[0]["total_pnl"] if realized_pnl_agg else 0
             
             return {
                 "active_positions": active_positions,
-                "total_trades": total_trades,
-                "total_pnl": total_pnl,
-                "active_bots": active_bots
+                "unrealized_pnl": unrealized_pnl,
+                "realized_pnl_30d": realized_pnl
             }
-            
         except Exception as e:
-            logger.error(f"Errore recupero statistiche: {e}")
-            return {}
+            logger.error(f"Errore nel recupero statistiche: {e}")
+            return {
+                "active_positions": 0,
+                "unrealized_pnl": 0,
+                "realized_pnl_30d": 0
+            }
+    
+    def get_system_stats(self) -> Dict:
+        """Recupera statistiche globali del sistema"""
+        try:
+            # Conteggio utenti
+            total_users = self.users.count_documents({})
+            active_users = self.users.count_documents({"is_active": True})
+            
+            # Conteggio bot
+            total_bots = self.bot_status.count_documents({})
+            active_bots = self.bot_status.count_documents({"status": "running"})
+            
+            # Conteggio posizioni
+            total_positions = self.active_positions.count_documents({"is_active": True})
+            
+            # Calcolo PnL totale
+            pnl_agg = list(self.active_positions.aggregate([
+                {"$match": {"is_active": True}},
+                {"$group": {"_id": None, "total_pnl": {"$sum": "$unrealized_pnl"}}}
+            ]))
+            total_pnl = pnl_agg[0]["total_pnl"] if pnl_agg else 0
+            
+            return {
+                "total_users": total_users,
+                "active_users": active_users,
+                "total_bots": total_bots,
+                "active_bots": active_bots,
+                "total_positions": total_positions,
+                "total_pnl": total_pnl
+            }
+        except Exception as e:
+            logger.error(f"Errore nel recupero statistiche sistema: {e}")
+            return {
+                "total_users": 0,
+                "active_users": 0,
+                "total_bots": 0,
+                "active_bots": 0,
+                "total_positions": 0,
+                "total_pnl": 0
+            }
+    
+    # =================== MAINTENANCE ===================
     
     def cleanup_old_data(self, days: int = 30):
-        """Pulisce dati vecchi"""
+        """Elimina dati vecchi per mantenere il database snello"""
         try:
             cutoff_date = datetime.now(timezone.utc) - timedelta(days=days)
             
-            # Rimuovi eventi di rischio vecchi risolti
-            self.risk_events.delete_many({
-                "timestamp": {"$lt": cutoff_date},
-                "resolved": True
-            })
+            # Rimuovi log vecchi
+            self.margin_balance_logs.delete_many({"timestamp": {"$lt": cutoff_date}})
             
-            # Rimuovi log margine vecchi
-            self.margin_balance_logs.delete_many({
-                "timestamp": {"$lt": cutoff_date}
-            })
+            # Rimuovi eventi di rischio risolti vecchi
+            self.risk_events.delete_many({"timestamp": {"$lt": cutoff_date}, "is_resolved": True})
             
-            logger.info(f"Cleanup dati vecchi completato (> {days} giorni)")
+            # Archivia trade history vecchia
+            # In un'implementazione reale, potresti spostarla in una collection di archiviazione
+            
+            logger.info(f"Pulizia dati vecchi completata (più vecchi di {days} giorni)")
             
         except Exception as e:
-            logger.error(f"Errore cleanup: {e}")
+            logger.error(f"Errore nella pulizia dati vecchi: {e}")
     
     def close(self):
-        """Chiude la connessione"""
-        if hasattr(self, 'client'):
+        """Chiude la connessione al database"""
+        if self.client:
             self.client.close()
-            logger.info("Connessione MongoDB chiusa")
+            logger.info("Connessione al database chiusa")
 
 
 # Test di connessione
